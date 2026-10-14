@@ -628,7 +628,7 @@ def configure(*, save_data: Optional[bool] = None, save_pickle: Optional[bool] =
 
 
 def _get_widget_save_path(fig) -> Path:
-    """Determine the save path for a widget figure."""
+    """Determine the save path for a widget figure, auto-incrementing to avoid overwrites."""
     base_dir = _widget_save_dir or Path('.')
 
     # Derive a filename — priority: suptitle > custom window title > figure_N
@@ -661,7 +661,15 @@ def _get_widget_save_path(fig) -> Path:
     if not name:
         name = 'figure'
 
-    return base_dir / name
+    # Auto-increment if folder already exists: ESR_sweep, ESR_sweep_1, ESR_sweep_2, …
+    candidate = base_dir / name
+    if candidate.exists():
+        counter = 1
+        while (base_dir / f"{name}_{counter}").exists():
+            counter += 1
+        candidate = base_dir / f"{name}_{counter}"
+
+    return candidate
 
 
 def _make_patched_widget_toolbar_save():
