@@ -664,51 +664,51 @@ def _get_widget_save_path(fig) -> Path:
     return base_dir / name
 
 
-def _make_patched_widget_save():
+def _make_patched_widget_toolbar_save():
     """
-    Create a patched _send_save_buffer for ipympl's Canvas.
+    Create a patched save_figure for ipympl's Toolbar.
 
-    When the user clicks the widget toolbar download button:
-    1. Normal browser download happens (unchanged)
-    2. ALSO saves .npz + .mplpkl to disk (based on _prefs)
+    This is the universal hook — works for ALL ipympl versions:
+      • Old (≤0.9.x): Toolbar.save_figure → send_event('save') → JS download
+      • New (0.10.0+): Toolbar.save_figure → canvas._send_save_buffer() → Python savefig
+
+    The patch:
+    1. Calls the original save_figure (browser download proceeds as normal)
+    2. ALSO writes image + .npz + .mplpkl to disk
 
     Prints paths to the notebook output cell so the user sees what was saved.
     """
 
-    def patched_send_save_buffer(self):
+    def patched_save_figure(self, *args):
         import io as _io
-        import json as _json
-
-        # --- 1. Do the original browser download ---
-        buf = _io.BytesIO()
         _ensure_mpl()
         from matplotlib import rcParams
 
-        # Use the ORIGINAL savefig to avoid triggering our Figure.savefig patch
-        if _original_savefig is not None:
-            _original_savefig(self.figure, buf)
-        else:
-            self.figure.savefig(buf)
+        fig = self.canvas.figure
 
-        fmt = rcParams.get('savefig.format', 'png')
-        data = buf.getvalue()
-
-        msg_data = {"type": "save", "format": fmt}
-        self.send({'data': _json.dumps(msg_data)}, buffers=[data])
+        # --- 1. Do the original browser download (unchanged) ---
+        if _original_widget_save is not None:
+            _original_widget_save(self, *args)
 
         # --- 2. Save extras to disk ---
-        fig = self.figure
         save_path = _get_widget_save_path(fig)
         folder = save_path
         stem = save_path.name
+        fmt = rcParams.get('savefig.format', 'png')
 
         saved = []
 
-        # Always save the image to disk too
+        # Always save the image to disk
         try:
             folder.mkdir(parents=True, exist_ok=True)
             img_path = folder / f"{stem}.{fmt}"
-            img_path.write_bytes(data)
+            buf = _io.BytesIO()
+            # Use ORIGINAL savefig to avoid triggering our Figure.savefig patch
+            if _original_savefig is not None:
+                _original_savefig(fig, buf, format=fmt)
+            else:
+                fig.savefig(buf, format=fmt)
+            img_path.write_bytes(buf.getvalue())
             saved.append(str(img_path))
         except Exception as e:
             warnings.warn(f"mpl_figure_saver: image disk save failed: {e}")
@@ -732,7 +732,7 @@ def _make_patched_widget_save():
             for s in saved:
                 print(f"   {Path(s).name}")
 
-    return patched_send_save_buffer
+    return patched_save_figure
 
 
 def install(*, patch_savefig: bool = True, patch_toolbar: bool = True,
@@ -777,9 +777,9 @@ def install(*, patch_savefig: bool = True, patch_toolbar: bool = True,
     # --- Patch ipympl widget save ---
     if patch_widget:
         try:
-            from ipympl.backend_nbagg import Canvas as IpyCanvas
-            _original_widget_save = IpyCanvas._send_save_buffer
-            IpyCanvas._send_save_buffer = _make_patched_widget_save()
+            from ipympl.backend_nbagg import Toolbar as IpyToolbar
+            _original_widget_save = IpyToolbar.save_figure
+            IpyToolbar.save_figure = _make_patched_widget_toolbar_save()
         except ImportError:
             pass  # ipympl not installed — that's fine
 
@@ -808,8 +808,8 @@ def uninstall():
 
     if _original_widget_save is not None:
         try:
-            from ipympl.backend_nbagg import Canvas as IpyCanvas
-            IpyCanvas._send_save_buffer = _original_widget_save
+            from ipympl.backend_nbagg import Toolbar as IpyToolbar
+            IpyToolbar.save_figure = _original_widget_save
         except ImportError:
             pass
         _original_widget_save = None
