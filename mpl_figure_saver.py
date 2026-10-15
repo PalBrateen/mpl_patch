@@ -113,9 +113,11 @@ def extract_plot_data(fig) -> dict:
     scatter, errorbars, bars, images, vertical/horizontal reference lines
     (axvline/axhline), standalone text, and whether a legend was shown.
 
+    Also captured: fill_between / fill_betweenx (source arrays reconstructed
+    from the polygon, including where= gaps) and twinx/twiny relationships.
+
     NOT captured as source arrays (pickle still preserves them visually):
-    fill_between / stackplot (PolyCollection), pcolormesh / contour (QuadMesh),
-    annotation arrows, and twin-axis relationships. See the module docstring.
+    stackplot, pcolormesh / contour (QuadMesh), and annotation arrows.
     """
     _ensure_mpl()
     import matplotlib.dates as mdates
@@ -129,7 +131,9 @@ def extract_plot_data(fig) -> dict:
         'axes': [],
     }
 
-    for ax in fig.axes:
+    twin_of, twin_kind = _twin_map(fig)
+
+    for ax_i, ax in enumerate(fig.axes):
         xaxis_tr = ax.get_xaxis_transform()
         yaxis_tr = ax.get_yaxis_transform()
 
@@ -154,9 +158,10 @@ def extract_plot_data(fig) -> dict:
             'ylim': tuple(float(v) for v in ax.get_ylim()),
             'x_is_date': x_is_date, 'y_is_date': y_is_date,
             'has_legend': ax.get_legend() is not None,
+            'twin_of': twin_of[ax_i], 'twin_kind': twin_kind[ax_i],
             'lines': [], 'scatter': [], 'images': [],
             'errorbars': [], 'bars': [], 'vlines': [], 'hlines': [],
-            'texts': [],
+            'texts': [], 'fills': [],
         }
 
         # --- Errorbar / bar containers (first, to tag errorbar lines) ---
@@ -233,6 +238,13 @@ def extract_plot_data(fig) -> dict:
                     entry['sizes'] = np.asarray(sizes)
                 ax_data['scatter'].append(entry)
 
+        # --- fill_between / fill_betweenx ---
+        for coll in ax.collections:
+            if getattr(coll, 't_direction', None) is not None:
+                fb = _extract_fill(coll)
+                if fb is not None:
+                    ax_data['fills'].append(fb)
+
         # --- Images (imshow) ---
         for img_obj in ax.get_images():
             ax_data['images'].append({
@@ -257,6 +269,101 @@ def extract_plot_data(fig) -> dict:
         result['axes'].append(ax_data)
 
     return result
+
+
+def _extract_fill(coll):
+    """Reconstruct fill_between / fill_betweenx source arrays from a
+    FillBetweenPolyCollection's polygon path(s).
+
+    Returns a dict {orient, t, lo, hi, facecolor, alpha, label} or None.
+    orient 'v' → replot with fill_between(t, lo, hi);
+    orient 'h' → replot with fill_betweenx(t, lo, hi).
+    Multiple polygons (from where=) are concatenated with NaN gaps.
+    """
+    _ensure_mpl()
+    from matplotlib.path import Path as _Path
+
+    t_dir = getattr(coll, 't_direction', None)   # 'x' vertical, 'y' horizontal
+    if t_dir is None:
+        return None  # not a fill_between collection (older mpl: not supported)
+    orient = 'v' if t_dir == 'x' else 'h'
+
+    t_all, lo_all, hi_all = [], [], []
+    for path in coll.get_paths():
+        v = path.vertices
+        codes = path.codes
+        if codes is not None:
+            v = v[codes != _Path.CLOSEPOLY]
+        if len(v) < 4:
+            continue
+        n = (len(v) - 2) // 2
+        if n < 1:
+            continue
+        lower = v[1:1 + n]            # (indep, boundary-1)
+        upper = v[1 + n + 1:1 + n + 1 + n][::-1]   # reversed (indep, boundary-2)
+        if len(upper) != n:
+            continue
+        if orient == 'v':
+            t, lo = lower[:, 0], lower[:, 1]
+            hi = upper[:, 1]
+        else:                          # horizontal: independent var is y
+            t, lo = lower[:, 1], lower[:, 0]
+            hi = upper[:, 0]
+        if t_all:                      # NaN gap between where-segments
+            t_all.append([np.nan]); lo_all.append([np.nan]); hi_all.append([np.nan])
+        t_all.append(t); lo_all.append(lo); hi_all.append(hi)
+
+    if not t_all:
+        return None
+    try:
+        fc = coll.get_facecolor()
+        facecolor = np.asarray(fc[0]).tolist() if fc is not None and len(fc) else None
+    except Exception:
+        facecolor = None
+    label = coll.get_label()
+    return {
+        'orient': orient,
+        't': np.concatenate(t_all),
+        'lo': np.concatenate(lo_all),
+        'hi': np.concatenate(hi_all),
+        'facecolor': facecolor,
+        'alpha': coll.get_alpha(),
+        'label': '' if (label or '').startswith('_') else label,
+    }
+
+
+def _twin_map(fig):
+    """Map each axes index → (twin_of_primary_index or None, 'x'|'y'|None).
+
+    A twinx shares the x-axis; a twiny shares the y-axis. The earliest axes in
+    a twinned group is treated as the primary.
+    """
+    axes = fig.axes
+    twin_of = [None] * len(axes)
+    kind = [None] * len(axes)
+    gx = axes[0].get_shared_x_axes() if axes else None
+    gy = axes[0].get_shared_y_axes() if axes else None
+    for i, ax in enumerate(axes):
+        sibs = None
+        grp = getattr(ax, '_twinned_axes', None)
+        if grp is not None:
+            try:
+                sibs = [axes.index(s) for s in grp.get_siblings(ax) if s in axes]
+            except Exception:
+                sibs = None
+        if not sibs or len(sibs) < 2:
+            continue
+        primary = min(sibs)
+        if i == primary:
+            continue
+        p_ax = axes[primary]
+        shares_x = gx.joined(ax, p_ax) if gx else False
+        shares_y = gy.joined(ax, p_ax) if gy else False
+        if shares_x and not shares_y:
+            twin_of[i], kind[i] = primary, 'x'
+        elif shares_y and not shares_x:
+            twin_of[i], kind[i] = primary, 'y'
+    return twin_of, kind
 
 
 def _extract_errorbar_err(container, axis='y'):
@@ -320,8 +427,10 @@ def replot_from_data(data: Union[dict, str, Path], *, show: bool = False):
 
     Reconstructs the common, round-trippable content (lines, scatter,
     errorbars, bars, images, axvline/axhline, text, scales, labels, limits,
-    legend, figure size). Does NOT reconstruct fill_between/pcolormesh/contour
-    or twin axes — use loadfig() on the .mplpkl when you need those back.
+    legend, figure size, fill_between/fill_betweenx, and twinx/twiny axes).
+    Does NOT reconstruct pcolormesh/contour or arbitrary subplot grid geometry
+    (primaries are laid out as an N-row column) — use loadfig() on the .mplpkl
+    when you need those back exactly.
     """
     _ensure_mpl()
     import matplotlib.dates as mdates
@@ -329,72 +438,104 @@ def replot_from_data(data: Union[dict, str, Path], *, show: bool = False):
     if isinstance(data, (str, Path)):
         data = load_plot_data(data)
 
-    n = max(1, len(data.get('axes', [])))
+    all_axes = data.get('axes', [])
+    # Primaries get their own subplot row; twins attach to their primary.
+    primaries = [i for i, ad in enumerate(all_axes) if ad.get('twin_of') is None]
+    n = max(1, len(primaries))
     figsize = data.get('figsize') or None
     fig, axs = _plt.subplots(n, 1, figsize=figsize, squeeze=False)
     axs = axs.ravel()
 
-    for ax, ad in zip(axs, data.get('axes', [])):
-        for ln in ad.get('lines', []):
-            x = mdates.num2date(ln['x']) if ad.get('x_is_date') else ln['x']
-            ax.plot(x, ln['y'],
-                    label=ln.get('label') or None,
-                    color=ln.get('color'), linestyle=ln.get('linestyle', '-'),
-                    linewidth=ln.get('linewidth'), marker=ln.get('marker', ''))
-        for sc in ad.get('scatter', []):
-            kw = {}
-            if 'sizes' in sc:
-                kw['s'] = sc['sizes']
-            if 'facecolors' in sc:
-                kw['c'] = sc['facecolors']
-            ax.scatter(sc['x'], sc['y'], label=sc.get('label') or None, **kw)
-        for eb in ad.get('errorbars', []):
-            yerr = eb.get('yerr'); xerr = eb.get('xerr')
-            ax.errorbar(eb['x'], eb['y'],
-                        yerr=yerr.T if yerr is not None else None,
-                        xerr=xerr.T if xerr is not None else None,
-                        fmt='o', label=eb.get('label') or None)
-        for b in ad.get('bars', []):
-            ax.bar(b['x'], b['heights'], width=b['widths'],
-                   label=b.get('label') or None, align='edge')
-        for im in ad.get('images', []):
-            ax.imshow(im['data'], extent=im.get('extent'),
-                      cmap=im.get('cmap'), aspect=im.get('aspect', 'equal'))
-            if im.get('clim') is not None:
-                ax.images[-1].set_clim(im['clim'])
-        for vl in ad.get('vlines', []):
-            ax.axvline(vl['x'], color=vl.get('color'),
-                       linestyle=vl.get('linestyle', '-'),
-                       linewidth=vl.get('linewidth'))
-        for hl in ad.get('hlines', []):
-            ax.axhline(hl['y'], color=hl.get('color'),
-                       linestyle=hl.get('linestyle', '-'),
-                       linewidth=hl.get('linewidth'))
-        for t in ad.get('texts', []):
-            ax.text(t['xy'][0], t['xy'][1], t['text'], color=t.get('color'))
+    axmap = {}                                   # data-index → live Axes
+    for row, i in enumerate(primaries):
+        axmap[i] = axs[row]
+    for i, ad in enumerate(all_axes):            # create twins on their primary
+        if ad.get('twin_of') is not None:
+            base = axmap.get(ad['twin_of'])
+            if base is None:
+                continue
+            axmap[i] = base.twinx() if ad.get('twin_kind') == 'x' else base.twiny()
 
-        if ad.get('xscale'):
-            ax.set_xscale(ad['xscale'])
-        if ad.get('yscale'):
-            ax.set_yscale(ad['yscale'])
-        ax.set_title(ad.get('title', ''))
-        ax.set_xlabel(ad.get('xlabel', ''))
-        ax.set_ylabel(ad.get('ylabel', ''))
-        try:
-            ax.set_xlim(ad['xlim']); ax.set_ylim(ad['ylim'])
-        except Exception:
-            pass
-        if ad.get('has_legend'):
-            handles, labels = ax.get_legend_handles_labels()
-            if labels:
-                ax.legend()
+    for i, ad in enumerate(all_axes):
+        ax = axmap.get(i)
+        if ax is not None:
+            _draw_axes(ax, ad, mdates)
 
     if data.get('suptitle'):
         fig.suptitle(data['suptitle'])
-    fig.tight_layout()
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
     if show:
         fig.show()
     return fig
+
+
+def _draw_axes(ax, ad, mdates):
+    """Draw one extracted axes dict onto a live Axes (used by replot)."""
+    for ln in ad.get('lines', []):
+        x = mdates.num2date(ln['x']) if ad.get('x_is_date') else ln['x']
+        ax.plot(x, ln['y'], label=ln.get('label') or None,
+                color=ln.get('color'), linestyle=ln.get('linestyle', '-'),
+                linewidth=ln.get('linewidth'), marker=ln.get('marker', ''))
+    for sc in ad.get('scatter', []):
+        kw = {}
+        if 'sizes' in sc:
+            kw['s'] = sc['sizes']
+        if 'facecolors' in sc:
+            kw['c'] = sc['facecolors']
+        ax.scatter(sc['x'], sc['y'], label=sc.get('label') or None, **kw)
+    for eb in ad.get('errorbars', []):
+        yerr = eb.get('yerr'); xerr = eb.get('xerr')
+        ax.errorbar(eb['x'], eb['y'],
+                    yerr=yerr.T if yerr is not None else None,
+                    xerr=xerr.T if xerr is not None else None,
+                    fmt='o', label=eb.get('label') or None)
+    for b in ad.get('bars', []):
+        ax.bar(b['x'], b['heights'], width=b['widths'],
+               label=b.get('label') or None, align='edge')
+    for fb in ad.get('fills', []):
+        kw = {}
+        if fb.get('facecolor') is not None:
+            kw['color'] = fb['facecolor']        # RGBA carries alpha already
+        elif fb.get('alpha') is not None:
+            kw['alpha'] = fb['alpha']
+        if fb.get('label'):
+            kw['label'] = fb['label']
+        if fb.get('orient') == 'h':
+            ax.fill_betweenx(fb['t'], fb['lo'], fb['hi'], **kw)
+        else:
+            ax.fill_between(fb['t'], fb['lo'], fb['hi'], **kw)
+    for im in ad.get('images', []):
+        ax.imshow(im['data'], extent=im.get('extent'),
+                  cmap=im.get('cmap'), aspect=im.get('aspect', 'equal'))
+        if im.get('clim') is not None:
+            ax.images[-1].set_clim(im['clim'])
+    for vl in ad.get('vlines', []):
+        ax.axvline(vl['x'], color=vl.get('color'),
+                   linestyle=vl.get('linestyle', '-'), linewidth=vl.get('linewidth'))
+    for hl in ad.get('hlines', []):
+        ax.axhline(hl['y'], color=hl.get('color'),
+                   linestyle=hl.get('linestyle', '-'), linewidth=hl.get('linewidth'))
+    for t in ad.get('texts', []):
+        ax.text(t['xy'][0], t['xy'][1], t['text'], color=t.get('color'))
+
+    if ad.get('xscale'):
+        ax.set_xscale(ad['xscale'])
+    if ad.get('yscale'):
+        ax.set_yscale(ad['yscale'])
+    ax.set_title(ad.get('title', ''))
+    ax.set_xlabel(ad.get('xlabel', ''))
+    ax.set_ylabel(ad.get('ylabel', ''))
+    try:
+        ax.set_xlim(ad['xlim']); ax.set_ylim(ad['ylim'])
+    except Exception:
+        pass
+    if ad.get('has_legend'):
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend()
 
 
 # ============================================================================
