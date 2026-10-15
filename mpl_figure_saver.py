@@ -1,59 +1,68 @@
 """
-mpl_figure_saver.py — MATLAB-like .fig saving for matplotlib (v2)
+mpl_figure_saver.py — MATLAB-like .fig saving for matplotlib (v3)
 ==================================================================
 
-Patches the matplotlib "Save" button across ALL backends:
+Patches the matplotlib "Save" button and fig.savefig() so every save also
+writes a version-proof data file (.npz) and a quick-reopen pickle (.mplpkl),
+and lets you reopen/edit or fully replot later without re-running analysis.
 
-  • Qt (PySide6/PyQt) toolbar   → custom dialog with checkboxes
-  • ipympl widget (%matplotlib widget / VSCode)  → auto-saves to disk alongside download
-  • Programmatic fig.savefig()  → auto-creates .mplpkl alongside
+Backends covered
+----------------
+  • Qt toolbar (PySide6 / PyQt)      → save dialog with checkboxes
+  • ipympl widget (%matplotlib widget, VSCode / Jupyter)
+        - mode 'dialog'    → local Python save dialog (A); nothing written on cancel
+        - mode 'timestamp' → plot_<timestamp>[_suptitle] folder (B); for SSH/headless
+  • fig.savefig()                    → folder/flat save alongside the image
+  • %matplotlib inline               → only via savefig() (no toolbar exists)
 
-Each save creates a folder:
+Each save produces (subject to the save_data / save_pickle toggles):
 
-    my_plot/
-      ├── my_plot.png              ← normal image (always)
-      ├── my_plot_data.npz         ← x/y arrays extracted from all axes (optional)
-      └── my_plot.mplpkl           ← pickle bundle for quick reopen (optional)
+    <name>/
+      ├── <name>.<fmt>         ← image in the requested/rc format   (always)
+      ├── <name>_data.npz      ← arrays extracted from every axes   (save_data)
+      └── <name>.mplpkl        ← pickle bundle for quick reopen      (save_pickle)
 
-Usage — Install once at the top of your script or notebook:
-    import mpl_figure_saver
-    mpl_figure_saver.install()
+Quick start
+-----------
+    import mpl_figure_saver as mfs
 
-    # For widget backend, optionally set where disk saves go:
-    mpl_figure_saver.set_save_dir('./figures')
+    # One call sets everything. Re-calling it re-applies the config
+    # (directory / toggles / widget mode) even though patching runs once.
+    mfs.install(
+        save_dir='/abs/path/to/figures',   # REQUIRED for the widget 'timestamp' mode
+        widget_mode='timestamp',           # 'timestamp' (default) or 'dialog'
+        save_data=True, save_pickle=True,
+    )
 
-    # Control what gets saved:
-    mpl_figure_saver.configure(save_data=True, save_pickle=False)
+Environment defaults (per machine, so one notebook runs everywhere):
+    MPL_FIG_SAVER_DIR   → default save_dir
+    MPL_FIG_SAVER_MODE  → default widget_mode ('timestamp' | 'dialog')
 
-Usage — Manual save / load:
-    mpl_figure_saver.savefig_bundle(fig, 'my_plot.mplpkl')
-    fig, extra = mpl_figure_saver.loadfig('my_plot.mplpkl')
+Reopen / replot
+---------------
+    fig, extra = mfs.loadfig('plot_.../plot_....mplpkl')   # pickle → editable figure
+    data = mfs.load_plot_data('plot_.../plot_..._data.npz')
+    fig  = mfs.replot_from_data(data)                      # rebuild from arrays
 
-    mpl_figure_saver.save_plot_data(fig, 'my_plot_data.npz')
-    data = mpl_figure_saver.load_plot_data('my_plot_data.npz')
-
-Usage — ExperimentResult (bundles raw data + analysis + figure):
+ExperimentResult (bundle raw data + analysis + figure in one .expr):
     from mpl_figure_saver import ExperimentResult
-    result = ExperimentResult('ESR #42', params={...})
-    result.store('frequencies', freq_array)
-    result.attach_figure(fig)
-    result.save('esr_042.expr')
+    r = ExperimentResult('ESR #42', params={...})
+    r.store('frequencies', freq); r.attach_figure(fig)
+    r.save('esr_042.expr')
+    r = ExperimentResult.load('esr_042.expr')
 
-    loaded = ExperimentResult.load('esr_042.expr')
-    loaded['frequencies']        # raw data back
-    loaded.get_figure()          # editable figure back
+SECURITY: .mplpkl / .expr use pickle. Only load files you trust — unpickling
+runs arbitrary code. The .npz is plain arrays and is always safe to load.
 
-Author : Claude / BP Lab
-Date   : 2026-04
-License: MIT
+Author : Claude / BP Lab   •   Date: 2026-04 → rev 2026-10   •   License: MIT
 """
 
 from __future__ import annotations
 
-import pickle
-import gzip
-import warnings
 import os
+import gzip
+import pickle
+import warnings
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Union
@@ -61,7 +70,7 @@ from typing import Any, Callable, Dict, Optional, Union
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Lazy imports — don't force backend selection at import time
+# Lazy matplotlib import — don't force a backend at import time
 # ---------------------------------------------------------------------------
 _mpl = None
 _plt = None
@@ -74,129 +83,135 @@ def _ensure_mpl():
         import matplotlib as mpl
         import matplotlib.pyplot as plt
         from matplotlib.figure import Figure
-        _mpl = mpl
-        _plt = plt
-        _Figure = Figure
+        _mpl, _plt, _Figure = mpl, plt, Figure
+
+
+def _loud(msg: str):
+    """Make a message hard to miss: stderr banner + a warning.
+
+    Widget toolbar callbacks sometimes route stdout to the kernel log rather
+    than the cell, so we use both channels.
+    """
+    line = "!" * 72
+    try:
+        import sys
+        print(f"\n{line}\n[mpl_figure_saver] {msg}\n{line}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    warnings.warn(f"mpl_figure_saver: {msg}", stacklevel=2)
 
 
 # ============================================================================
-#  DATA EXTRACTION — pull x/y/image arrays from a matplotlib figure
+#  DATA EXTRACTION
 # ============================================================================
 
 def extract_plot_data(fig) -> dict:
-    """
-    Walk every Axes in `fig` and extract the underlying numeric data.
+    """Walk every Axes in `fig` and pull out the underlying numeric data.
 
-    Handles: Line2D (plot), PathCollection (scatter), AxesImage (imshow),
-    ErrorbarContainer, bar containers, and text annotations.
+    Captured (round-trippable by replot_from_data): figure size, suptitle; per
+    axes the title/labels/limits/scales, a date flag, lines (labeled OR not),
+    scatter, errorbars, bars, images, vertical/horizontal reference lines
+    (axvline/axhline), standalone text, and whether a legend was shown.
 
-    Returns
-    -------
-    dict with structure:
-        {
-            'axes': [
-                {
-                    'title': str,
-                    'xlabel': str,  'ylabel': str,
-                    'xlim': (lo, hi), 'ylim': (lo, hi),
-                    'lines': [
-                        {'x': ndarray, 'y': ndarray, 'label': str, 'color': ..., 'linestyle': ...},
-                        ...
-                    ],
-                    'scatter': [
-                        {'x': ndarray, 'y': ndarray, 'label': str},
-                        ...
-                    ],
-                    'images': [
-                        {'data': ndarray, 'extent': ..., 'cmap': str},
-                        ...
-                    ],
-                    'errorbars': [
-                        {'x': ndarray, 'y': ndarray, 'yerr': ndarray, 'xerr': ndarray, 'label': str},
-                        ...
-                    ],
-                    'bars': [
-                        {'x': ndarray, 'heights': ndarray, 'widths': ndarray, 'label': str},
-                        ...
-                    ],
-                },
-                ...
-            ],
-            'suptitle': str,
-        }
+    NOT captured as source arrays (pickle still preserves them visually):
+    fill_between / stackplot (PolyCollection), pcolormesh / contour (QuadMesh),
+    annotation arrows, and twin-axis relationships. See the module docstring.
     """
     _ensure_mpl()
+    import matplotlib.dates as mdates
     from matplotlib.collections import PathCollection
     from matplotlib.container import ErrorbarContainer, BarContainer
-    from matplotlib.image import AxesImage
 
     result = {
-        'axes': [],
+        'format_version': 3,
+        'figsize': tuple(float(v) for v in fig.get_size_inches()),
         'suptitle': fig._suptitle.get_text() if fig._suptitle else '',
+        'axes': [],
     }
 
     for ax in fig.axes:
+        xaxis_tr = ax.get_xaxis_transform()
+        yaxis_tr = ax.get_yaxis_transform()
+
+        # Detect date axes so we can store numeric values + a flag.
+        def _is_date(axis):
+            conv = axis.get_converter() if hasattr(axis, 'get_converter') else None
+            return isinstance(conv, mdates.DateConverter) or \
+                isinstance(conv, getattr(mdates, '_SwitchableDateConverter', ()))
+        x_is_date = _is_date(ax.xaxis)
+        y_is_date = _is_date(ax.yaxis)
+
+        def _num(vals, is_date):
+            if is_date:
+                return np.asarray(mdates.date2num(vals), dtype=np.float64)
+            return np.asarray(vals, dtype=np.float64)
+
         ax_data = {
             'title': ax.get_title(),
-            'xlabel': ax.get_xlabel(),
-            'ylabel': ax.get_ylabel(),
+            'xlabel': ax.get_xlabel(), 'ylabel': ax.get_ylabel(),
+            'xscale': ax.get_xscale(), 'yscale': ax.get_yscale(),
             'xlim': tuple(float(v) for v in ax.get_xlim()),
             'ylim': tuple(float(v) for v in ax.get_ylim()),
-            'lines': [],
-            'scatter': [],
-            'images': [],
-            'errorbars': [],
-            'bars': [],
+            'x_is_date': x_is_date, 'y_is_date': y_is_date,
+            'has_legend': ax.get_legend() is not None,
+            'lines': [], 'scatter': [], 'images': [],
+            'errorbars': [], 'bars': [], 'vlines': [], 'hlines': [],
+            'texts': [],
         }
 
-        # --- Errorbar containers (extract BEFORE lines to tag errorbar lines) ---
+        # --- Errorbar / bar containers (first, to tag errorbar lines) ---
         errorbar_line_ids = set()
-        if hasattr(ax, 'containers'):
-            for cont in ax.containers:
-                if isinstance(cont, ErrorbarContainer):
-                    data_line = cont[0]  # the main Line2D
-                    if data_line is not None:
-                        errorbar_line_ids.add(id(data_line))
-                        xd = np.asarray(data_line.get_xdata(), dtype=np.float64)
-                        yd = np.asarray(data_line.get_ydata(), dtype=np.float64)
+        for cont in getattr(ax, 'containers', []):
+            if isinstance(cont, ErrorbarContainer):
+                data_line = cont[0]
+                if data_line is not None:
+                    errorbar_line_ids.add(id(data_line))
+                    ax_data['errorbars'].append({
+                        'x': _num(data_line.get_xdata(), x_is_date),
+                        'y': _num(data_line.get_ydata(), y_is_date),
+                        'yerr': _extract_errorbar_err(cont, 'y'),
+                        'xerr': _extract_errorbar_err(cont, 'x'),
+                        'label': data_line.get_label(),
+                    })
+            elif isinstance(cont, BarContainer):
+                patches = cont.patches
+                if patches:
+                    ax_data['bars'].append({
+                        'x': np.array([p.get_x() for p in patches]),
+                        'heights': np.array([p.get_height() for p in patches]),
+                        'widths': np.array([p.get_width() for p in patches]),
+                        'label': cont.get_label(),
+                    })
 
-                        # Extract error magnitudes from the cap/bar lines
-                        yerr = _extract_errorbar_err(cont, axis='y')
-                        xerr = _extract_errorbar_err(cont, axis='x')
-
-                        ax_data['errorbars'].append({
-                            'x': xd, 'y': yd,
-                            'yerr': yerr, 'xerr': xerr,
-                            'label': data_line.get_label(),
-                        })
-
-                elif isinstance(cont, BarContainer):
-                    patches = cont.patches
-                    if patches:
-                        xs = np.array([p.get_x() for p in patches])
-                        heights = np.array([p.get_height() for p in patches])
-                        widths = np.array([p.get_width() for p in patches])
-                        ax_data['bars'].append({
-                            'x': xs, 'heights': heights, 'widths': widths,
-                            'label': cont.get_label(),
-                        })
-
-        # --- Line2D objects (skip errorbar internals) ---
+        # --- Lines: data lines (kept even if unlabeled) vs axvline/axhline ---
         for line in ax.get_lines():
             if id(line) in errorbar_line_ids:
                 continue
-            label = line.get_label()
-            if label.startswith('_'):  # matplotlib internal lines
+            tr = line.get_transform()
+            if tr is xaxis_tr:                       # axvline
+                xd = np.asarray(line.get_xdata(), dtype=np.float64)
+                ax_data['vlines'].append({
+                    'x': float(xd[0]) if xd.size else np.nan,
+                    'color': line.get_color(), 'linestyle': line.get_linestyle(),
+                    'linewidth': line.get_linewidth(), 'label': line.get_label(),
+                })
                 continue
-            xd = np.asarray(line.get_xdata(), dtype=np.float64)
-            yd = np.asarray(line.get_ydata(), dtype=np.float64)
+            if tr is yaxis_tr:                        # axhline
+                yd = np.asarray(line.get_ydata(), dtype=np.float64)
+                ax_data['hlines'].append({
+                    'y': float(yd[0]) if yd.size else np.nan,
+                    'color': line.get_color(), 'linestyle': line.get_linestyle(),
+                    'linewidth': line.get_linewidth(), 'label': line.get_label(),
+                })
+                continue
+            label = line.get_label()
             ax_data['lines'].append({
-                'x': xd, 'y': yd,
-                'label': label,
-                'color': line.get_color(),
-                'linestyle': line.get_linestyle(),
-                'linewidth': line.get_linewidth(),
-                'marker': line.get_marker(),
+                'x': _num(line.get_xdata(), x_is_date),
+                'y': _num(line.get_ydata(), y_is_date),
+                # auto labels like "_child0" become '' so replot won't legend them
+                'label': '' if label.startswith('_') else label,
+                'color': line.get_color(), 'linestyle': line.get_linestyle(),
+                'linewidth': line.get_linewidth(), 'marker': line.get_marker(),
             })
 
         # --- Scatter (PathCollection) ---
@@ -205,16 +220,14 @@ def extract_plot_data(fig) -> dict:
                 offsets = np.asarray(coll.get_offsets(), dtype=np.float64)
                 if offsets.size == 0:
                     continue
+                label = coll.get_label()
                 entry = {
-                    'x': offsets[:, 0],
-                    'y': offsets[:, 1],
-                    'label': coll.get_label(),
+                    'x': offsets[:, 0], 'y': offsets[:, 1],
+                    'label': '' if label.startswith('_') else label,
                 }
-                # Color array if present
                 fc = coll.get_facecolors()
                 if fc is not None and len(fc) > 1:
                     entry['facecolors'] = np.asarray(fc)
-                # Sizes
                 sizes = coll.get_sizes()
                 if sizes is not None and len(sizes) > 1:
                     entry['sizes'] = np.asarray(sizes)
@@ -222,12 +235,23 @@ def extract_plot_data(fig) -> dict:
 
         # --- Images (imshow) ---
         for img_obj in ax.get_images():
-            arr = np.asarray(img_obj.get_array())
             ax_data['images'].append({
-                'data': arr,
+                'data': np.asarray(img_obj.get_array()),
                 'extent': img_obj.get_extent(),
                 'cmap': img_obj.get_cmap().name if img_obj.get_cmap() else None,
                 'clim': img_obj.get_clim(),
+                'aspect': ax.get_aspect(),
+            })
+
+        # --- Standalone text / annotation text ---
+        for t in ax.texts:
+            s = t.get_text()
+            if not s:
+                continue
+            ax_data['texts'].append({
+                'text': s,
+                'xy': tuple(float(v) for v in t.get_position()),
+                'color': t.get_color(),
             })
 
         result['axes'].append(ax_data)
@@ -236,64 +260,145 @@ def extract_plot_data(fig) -> dict:
 
 
 def _extract_errorbar_err(container, axis='y'):
-    """Extract error magnitudes from an ErrorbarContainer."""
-    # container = (data_line, cap_lines, bar_line_collections)
-    barlines = container[2]  # list of LineCollections
+    """Extract error magnitudes from an ErrorbarContainer, or None if that
+    axis has no error bars (so an xerr-only plot reports yerr=None, not zeros)."""
+    barlines = container[2]
     if not barlines:
         return None
-
     data_line = container[0]
     data_vals = np.asarray(
         data_line.get_ydata() if axis == 'y' else data_line.get_xdata(),
-        dtype=np.float64
+        dtype=np.float64,
     )
-
-    idx = 0 if axis == 'x' else (0 if len(barlines) == 1 else
-                                  (1 if len(barlines) == 2 else 0))
-    # For y errors: barlines[0] if only yerr, barlines[-1] if both xerr+yerr
     try:
-        if axis == 'y':
-            bc = barlines[-1] if len(barlines) >= 1 else None
+        # Heuristic layout of the bar LineCollections:
+        #   yerr only            -> [y]
+        #   xerr only            -> [x]
+        #   both (xerr, yerr)    -> [x, y]
+        if len(barlines) >= 2:
+            bc = barlines[1] if axis == 'y' else barlines[0]
         else:
-            bc = barlines[0] if len(barlines) >= 2 else None
-
-        if bc is None:
-            return None
-
+            bc = barlines[0]
         segments = bc.get_segments()
         if not segments:
             return None
-
-        # Each segment is [[x, y_lo], [x, y_hi]]
-        err_lo = np.array([seg[0][1 if axis == 'y' else 0] for seg in segments])
-        err_hi = np.array([seg[1][1 if axis == 'y' else 0] for seg in segments])
-        return np.column_stack([data_vals - err_lo, err_hi - data_vals])
+        comp = 1 if axis == 'y' else 0
+        # A y-error collection has segments that vary in y; if this collection
+        # is actually the other axis, its chosen component won't vary -> None.
+        lo = np.array([seg[0][comp] for seg in segments], dtype=np.float64)
+        hi = np.array([seg[1][comp] for seg in segments], dtype=np.float64)
+        if np.allclose(lo, hi):
+            return None
+        return np.column_stack([data_vals - lo, hi - data_vals])
     except Exception:
         return None
 
 
 def save_plot_data(fig, path: Union[str, Path]):
-    """
-    Extract all numeric data from `fig` and save as a `.npz` file.
+    """Extract all numeric data from `fig` → compressed `.npz`.
 
-    The .npz contains a dict-of-arrays structure.  Load with:
-        data = np.load('my_data.npz', allow_pickle=True)
-        plot_info = data['plot_data'].item()  # dict
+    Load with load_plot_data(), or:
+        d = np.load('x.npz', allow_pickle=True)['plot_data'].item()
     """
     path = Path(path).with_suffix('.npz')
-    plot_data = extract_plot_data(fig)
-    np.savez_compressed(str(path), plot_data=plot_data)
+    np.savez_compressed(str(path), plot_data=extract_plot_data(fig))
     return path
 
 
 def load_plot_data(path: Union[str, Path]) -> dict:
-    """Load a .npz file saved by save_plot_data()."""
+    """Load a `.npz` written by save_plot_data()."""
     data = np.load(str(path), allow_pickle=True)
     return data['plot_data'].item()
 
 
 # ============================================================================
-#  PICKLE BUNDLE — save / load full matplotlib figure objects
+#  REPLOT FROM EXTRACTED DATA  (version-proof path — no pickle)
+# ============================================================================
+
+def replot_from_data(data: Union[dict, str, Path], *, show: bool = False):
+    """Rebuild a figure from an extract_plot_data() dict or a .npz path.
+
+    Reconstructs the common, round-trippable content (lines, scatter,
+    errorbars, bars, images, axvline/axhline, text, scales, labels, limits,
+    legend, figure size). Does NOT reconstruct fill_between/pcolormesh/contour
+    or twin axes — use loadfig() on the .mplpkl when you need those back.
+    """
+    _ensure_mpl()
+    import matplotlib.dates as mdates
+
+    if isinstance(data, (str, Path)):
+        data = load_plot_data(data)
+
+    n = max(1, len(data.get('axes', [])))
+    figsize = data.get('figsize') or None
+    fig, axs = _plt.subplots(n, 1, figsize=figsize, squeeze=False)
+    axs = axs.ravel()
+
+    for ax, ad in zip(axs, data.get('axes', [])):
+        for ln in ad.get('lines', []):
+            x = mdates.num2date(ln['x']) if ad.get('x_is_date') else ln['x']
+            ax.plot(x, ln['y'],
+                    label=ln.get('label') or None,
+                    color=ln.get('color'), linestyle=ln.get('linestyle', '-'),
+                    linewidth=ln.get('linewidth'), marker=ln.get('marker', ''))
+        for sc in ad.get('scatter', []):
+            kw = {}
+            if 'sizes' in sc:
+                kw['s'] = sc['sizes']
+            if 'facecolors' in sc:
+                kw['c'] = sc['facecolors']
+            ax.scatter(sc['x'], sc['y'], label=sc.get('label') or None, **kw)
+        for eb in ad.get('errorbars', []):
+            yerr = eb.get('yerr'); xerr = eb.get('xerr')
+            ax.errorbar(eb['x'], eb['y'],
+                        yerr=yerr.T if yerr is not None else None,
+                        xerr=xerr.T if xerr is not None else None,
+                        fmt='o', label=eb.get('label') or None)
+        for b in ad.get('bars', []):
+            ax.bar(b['x'], b['heights'], width=b['widths'],
+                   label=b.get('label') or None, align='edge')
+        for im in ad.get('images', []):
+            ax.imshow(im['data'], extent=im.get('extent'),
+                      cmap=im.get('cmap'), aspect=im.get('aspect', 'equal'))
+            if im.get('clim') is not None:
+                ax.images[-1].set_clim(im['clim'])
+        for vl in ad.get('vlines', []):
+            ax.axvline(vl['x'], color=vl.get('color'),
+                       linestyle=vl.get('linestyle', '-'),
+                       linewidth=vl.get('linewidth'))
+        for hl in ad.get('hlines', []):
+            ax.axhline(hl['y'], color=hl.get('color'),
+                       linestyle=hl.get('linestyle', '-'),
+                       linewidth=hl.get('linewidth'))
+        for t in ad.get('texts', []):
+            ax.text(t['xy'][0], t['xy'][1], t['text'], color=t.get('color'))
+
+        if ad.get('xscale'):
+            ax.set_xscale(ad['xscale'])
+        if ad.get('yscale'):
+            ax.set_yscale(ad['yscale'])
+        ax.set_title(ad.get('title', ''))
+        ax.set_xlabel(ad.get('xlabel', ''))
+        ax.set_ylabel(ad.get('ylabel', ''))
+        try:
+            ax.set_xlim(ad['xlim']); ax.set_ylim(ad['ylim'])
+        except Exception:
+            pass
+        if ad.get('has_legend'):
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
+                ax.legend()
+
+    if data.get('suptitle'):
+        fig.suptitle(data['suptitle'])
+    fig.tight_layout()
+    if show:
+        fig.show()
+    return fig
+
+
+# ============================================================================
+#  PICKLE BUNDLE
 # ============================================================================
 
 _MAGIC = b'MPLPKL01'
@@ -302,21 +407,14 @@ _COMPRESSION_LEVEL = 6
 
 def savefig_bundle(fig, path: Union[str, Path], *, compress: bool = True,
                    extra_data: Optional[dict] = None):
-    """
-    Save a matplotlib Figure to a re-openable `.mplpkl` pickle bundle.
+    """Save a Figure to a re-openable `.mplpkl`.
 
-    Parameters
-    ----------
-    fig : matplotlib.figure.Figure
-    path : str or Path
-    compress : bool
-        gzip the pickle (default True, ~3-5× smaller).
-    extra_data : dict, optional
-        Extra arrays / metadata to store alongside the figure.
+    If the figure contains an unpicklable artist (e.g. a lambda tick
+    formatter), the pickle is skipped with a loud warning rather than
+    silently dying — the .npz remains your safety net.
     """
     _ensure_mpl()
     path = Path(path).with_suffix('.mplpkl')
-
     bundle = {
         'figure': fig,
         'matplotlib_version': _mpl.__version__,
@@ -324,119 +422,102 @@ def savefig_bundle(fig, path: Union[str, Path], *, compress: bool = True,
         'timestamp': datetime.now().isoformat(),
         'extra_data': extra_data or {},
     }
-
-    payload = pickle.dumps(bundle, protocol=pickle.HIGHEST_PROTOCOL)
-    if compress:
-        payload = _MAGIC + gzip.compress(payload, compresslevel=_COMPRESSION_LEVEL)
-    else:
-        payload = _MAGIC + payload
-
+    try:
+        payload = pickle.dumps(bundle, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        _loud(f"pickle failed ({type(e).__name__}: {e}); .mplpkl NOT written for "
+              f"{path.name}. The .npz (if enabled) is unaffected. Common cause: "
+              f"a lambda in set_major_formatter — use a named function or "
+              f"matplotlib.ticker.FormatStrFormatter.")
+        return None
+    payload = _MAGIC + (gzip.compress(payload, _COMPRESSION_LEVEL) if compress else payload)
     path.write_bytes(payload)
     return path
 
 
 def loadfig(path: Union[str, Path], *, show: bool = False):
-    """
-    Load a `.mplpkl` bundle → (fig, extra_data).
+    """Load a `.mplpkl` → (fig, extra_data), re-bound to a live pyplot canvas.
 
-    The figure is re-attached to a live canvas so plt.show() works.
+    Warns if the loading matplotlib version differs from the saving one.
     """
     _ensure_mpl()
     path = Path(path)
     raw = path.read_bytes()
-
     if not raw.startswith(_MAGIC):
         raise ValueError(f"{path} is not a valid .mplpkl file")
 
     payload = raw[len(_MAGIC):]
     try:
         payload = gzip.decompress(payload)
-    except gzip.BadGzipFile:
+    except (gzip.BadGzipFile, OSError):
         pass
-
     bundle = pickle.loads(payload)
     fig = bundle['figure']
 
-    # Re-attach to a live canvas
+    saved_ver = bundle.get('matplotlib_version')
+    if saved_ver and saved_ver != _mpl.__version__:
+        warnings.warn(
+            f"mpl_figure_saver: .mplpkl was saved with matplotlib {saved_ver}, "
+            f"loading with {_mpl.__version__}. If it looks wrong, replot from "
+            f"the .npz via replot_from_data().", stacklevel=2)
+
+    # Re-bind to a fresh pyplot-managed canvas so plt.show() finds it.
+    # (Create the host figure, point its manager at our figure — do NOT close
+    # the host first, which was the v2 bug that orphaned the canvas.)
     try:
-        dummy_manager = _plt.figure()
-        _plt.close(dummy_manager)
-        fig.set_canvas(dummy_manager.canvas)
-        fig.canvas.manager = dummy_manager.canvas.manager
-        fig.canvas.manager.canvas.figure = fig
-        fig.canvas.manager.set_window_title(
-            f"[Loaded] {path.stem}  ({bundle.get('timestamp', '?')})"
-        )
+        host = _plt.figure()
+        manager = host.canvas.manager
+        manager.canvas.figure = fig
+        fig.set_canvas(manager.canvas)
+        try:
+            manager.set_window_title(f"[Loaded] {path.stem}")
+        except Exception:
+            pass
     except Exception:
-        pass  # headless backend
+        pass  # headless (Agg) — figure object is still fully usable
 
     if show:
         fig.show()
-
     return fig, bundle.get('extra_data', {})
 
 
 # ============================================================================
-#  FOLDER-BASED SAVE — image + npz + mplpkl in one directory
+#  FOLDER-BASED SAVE
 # ============================================================================
 
 def save_figure_folder(fig, filepath: Union[str, Path], *,
-                       save_data: bool = True,
-                       save_pickle: bool = True,
+                       save_data: bool = True, save_pickle: bool = True,
                        savefig_kwargs: Optional[dict] = None):
-    """
-    Save a figure into a folder containing image + data + pickle.
-
-    Parameters
-    ----------
-    fig : matplotlib.figure.Figure
-    filepath : path to the image file (e.g. 'plots/esr.png')
-        A folder is created alongside: plots/esr/esr.png + esr_data.npz + esr.mplpkl
-    save_data : bool
-        Save extracted plot data as .npz (default True).
-    save_pickle : bool
-        Save pickle bundle as .mplpkl (default True).
-    savefig_kwargs : dict
-        Extra kwargs passed to the real savefig (dpi, bbox_inches, etc.).
-    """
+    """Save image + optional .npz + optional .mplpkl into <parent>/<stem>/."""
     _ensure_mpl()
     filepath = Path(filepath)
     stem = filepath.stem
     ext = filepath.suffix or '.png'
     folder = filepath.parent / stem
-
     folder.mkdir(parents=True, exist_ok=True)
 
     img_path = folder / f"{stem}{ext}"
     kwargs = savefig_kwargs or {}
-
-    # Save the normal image — use the ORIGINAL savefig to avoid recursion
     if _original_savefig is not None:
         _original_savefig(fig, str(img_path), **kwargs)
     else:
         fig.savefig(str(img_path), **kwargs)
-
     saved = [str(img_path)]
 
     if save_data:
         try:
-            npz_path = save_plot_data(fig, folder / f"{stem}_data")
-            saved.append(str(npz_path))
+            saved.append(str(save_plot_data(fig, folder / f"{stem}_data")))
         except Exception as e:
-            warnings.warn(f"mpl_figure_saver: data extraction failed: {e}")
-
+            _loud(f"data extraction failed: {e}")
     if save_pickle:
-        try:
-            pkl_path = savefig_bundle(fig, folder / stem)
-            saved.append(str(pkl_path))
-        except Exception as e:
-            warnings.warn(f"mpl_figure_saver: pickle save failed: {e}")
-
+        p = savefig_bundle(fig, folder / stem)
+        if p is not None:
+            saved.append(str(p))
     return folder, saved
 
 
 # ============================================================================
-#  TOOLBAR PATCH — custom save dialog with checkboxes
+#  STATE
 # ============================================================================
 
 _original_savefig = None
@@ -444,352 +525,330 @@ _original_toolbar_save = None
 _original_widget_save = None
 _installed = False
 
-# Persistent checkbox state across save dialogs within one session
-_prefs = {
-    'save_data': True,
-    'save_pickle': True,
-}
+_prefs = {'save_data': True, 'save_pickle': True}
 
-# Widget backend save directory — where .npz/.mplpkl go for %matplotlib widget
 _widget_save_dir: Optional[Path] = None
-
-
-def _make_patched_toolbar_save(OrigToolbarClass):
-    """
-    Create a patched save_figure method for a Qt NavigationToolbar.
-
-    Adds checkboxes to the file dialog:
-        ☑ Also save plot data (.npz)
-        ☑ Also save editable figure (.mplpkl)
-    """
-
-    def patched_save_figure(self, *args):
-        from matplotlib.backends.qt_compat import QtWidgets, QtCore
-
-        # --- Build the file filter list (same as original) ---
-        filetypes = self.canvas.get_supported_filetypes_grouped()
-        sorted_filetypes = sorted(filetypes.items())
-        default_filetype = self.canvas.get_default_filetype()
-
-        startpath = os.path.expanduser(_mpl.rcParams['savefig.directory'])
-        start = os.path.join(startpath, self.canvas.get_default_filename())
-
-        filters = []
-        selectedFilter = None
-        for name, exts in sorted_filetypes:
-            exts_list = " ".join([f'*.{ext}' for ext in exts])
-            filt = f'{name} ({exts_list})'
-            if default_filetype in exts:
-                selectedFilter = filt
-            filters.append(filt)
-        filters = ';;'.join(filters)
-
-        # --- Create custom file dialog with checkboxes ---
-        dlg = QtWidgets.QFileDialog(
-            self.canvas.parent(), "Choose a filename to save to"
-        )
-        dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptMode.AcceptSave)
-        dlg.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
-        dlg.setNameFilter(filters)
-        if selectedFilter:
-            dlg.selectNameFilter(selectedFilter)
-        dlg.selectFile(start)
-
-        # Inject checkboxes into the dialog grid layout
-        layout = dlg.layout()
-        if layout is not None:
-            container = QtWidgets.QWidget()
-            hbox = QtWidgets.QHBoxLayout(container)
-            hbox.setContentsMargins(0, 4, 0, 0)
-
-            cb_data = QtWidgets.QCheckBox("Also save plot data (.npz)")
-            cb_data.setChecked(_prefs['save_data'])
-            cb_data.setToolTip(
-                "Extracts x/y arrays from all lines, scatter, images, and errorbars\n"
-                "into a version-proof .npz file you can always reload and replot."
-            )
-
-            cb_pickle = QtWidgets.QCheckBox("Also save editable figure (.mplpkl)")
-            cb_pickle.setChecked(_prefs['save_pickle'])
-            cb_pickle.setToolTip(
-                "Saves the full matplotlib Figure object as a pickle.\n"
-                "Reopen with mpl_figure_saver.loadfig() to edit titles, labels, etc.\n"
-                "Note: may not survive major matplotlib version changes."
-            )
-
-            hbox.addWidget(cb_data)
-            hbox.addSpacing(20)
-            hbox.addWidget(cb_pickle)
-            hbox.addStretch()
-
-            row = layout.rowCount()
-            layout.addWidget(container, row, 0, 1, layout.columnCount())
-
-        # --- Show dialog ---
-        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return None
-
-        fnames = dlg.selectedFiles()
-        if not fnames:
-            return None
-        fname = fnames[0]
-
-        # Persist checkbox state for the session
-        want_data = cb_data.isChecked() if layout else _prefs['save_data']
-        want_pickle = cb_pickle.isChecked() if layout else _prefs['save_pickle']
-        _prefs['save_data'] = want_data
-        _prefs['save_pickle'] = want_pickle
-
-        # Save directory for next time
-        if startpath != "":
-            _mpl.rcParams['savefig.directory'] = os.path.dirname(fname)
-
-        # --- Perform the saves ---
-        try:
-            if want_data or want_pickle:
-                # Folder-based save: image + extras
-                save_figure_folder(
-                    self.canvas.figure, fname,
-                    save_data=want_data,
-                    save_pickle=want_pickle,
-                )
-            else:
-                # Plain image only — original behavior
-                self.canvas.figure.savefig(fname)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Error saving file", str(e),
-                QtWidgets.QMessageBox.StandardButton.Ok,
-                QtWidgets.QMessageBox.StandardButton.NoButton,
-            )
-
-        return fname
-
-    return patched_save_figure
-
-
-def _patched_savefig(self, fname, *args, **kwargs):
-    """Drop-in replacement for Figure.savefig — also writes .mplpkl alongside."""
-    import io as _io
-    result = _original_savefig(self, fname, *args, **kwargs)
-
-    # Skip if fname is a BytesIO (widget backend) — the widget patch handles that
-    if isinstance(fname, _io.IOBase):
-        return result
-
-    try:
-        p = Path(str(fname))
-        # Don't double-save if this was triggered from the toolbar folder save
-        if p.suffix != '.mplpkl':
-            savefig_bundle(self, p.with_suffix('.mplpkl'))
-    except Exception as e:
-        warnings.warn(f"mpl_figure_saver: auto-bundle failed: {e}")
-
-    return result
+_widget_mode: str = 'timestamp'          # 'timestamp' (B) | 'dialog' (A)
+_widget_browser_download: Optional[bool] = None   # None → auto per mode
 
 
 # ============================================================================
-#  WIDGET BACKEND PATCH — %matplotlib widget (ipympl / VSCode / Jupyter)
+#  CONFIG (standalone; also reachable through install())
 # ============================================================================
 
 def set_save_dir(path: Union[str, Path]):
-    """
-    Set the directory where widget saves write .npz / .mplpkl files.
-
-    Call this once in your notebook:
-        mpl_figure_saver.set_save_dir('./figures')
-
-    Without this, widget saves go to the current working directory.
-    """
+    """Set the directory for widget disk saves. Resolved to an absolute path
+    immediately, so a later os.chdir() cannot move it. Created if missing."""
     global _widget_save_dir
-    _widget_save_dir = Path(path)
+    _widget_save_dir = Path(path).expanduser().resolve()
     _widget_save_dir.mkdir(parents=True, exist_ok=True)
+    return _widget_save_dir
 
 
-def configure(*, save_data: Optional[bool] = None, save_pickle: Optional[bool] = None):
-    """
-    Set which extras are saved by default.
-
-    Parameters
-    ----------
-    save_data : bool, optional
-        Save extracted .npz data (default True).
-    save_pickle : bool, optional
-        Save .mplpkl pickle bundle (default True).
-
-    Example
-    -------
-    >>> mpl_figure_saver.configure(save_data=True, save_pickle=False)
-    """
+def configure(*, save_data: Optional[bool] = None,
+              save_pickle: Optional[bool] = None,
+              widget_mode: Optional[str] = None,
+              widget_browser_download: Optional[bool] = None):
+    """Set which extras are saved and how the widget save behaves."""
+    global _widget_mode, _widget_browser_download
     if save_data is not None:
         _prefs['save_data'] = save_data
     if save_pickle is not None:
         _prefs['save_pickle'] = save_pickle
+    if widget_mode is not None:
+        if widget_mode not in ('timestamp', 'dialog'):
+            raise ValueError("widget_mode must be 'timestamp' or 'dialog'")
+        _widget_mode = widget_mode
+    if widget_browser_download is not None:
+        _widget_browser_download = widget_browser_download
 
 
-def _get_widget_save_path(fig) -> Path:
-    """Determine the save path for a widget figure, auto-incrementing to avoid overwrites."""
-    base_dir = _widget_save_dir or Path('.')
+# ============================================================================
+#  WIDGET SAVE PATH
+# ============================================================================
 
-    # Derive a filename — priority: suptitle > custom window title > figure_N
-    name = ''
+def _sanitize(name: str) -> str:
+    bad = '<>:"/\\|?*\0 '
+    name = name.translate({ord(c): '_' for c in bad}).strip('_')
+    return name or 'figure'
 
-    # 1. Suptitle (most likely to be a meaningful user-set name)
+
+def _figure_name_hint(fig) -> str:
+    """Best-effort human name: suptitle > custom window title > ''."""
     if fig._suptitle:
-        text = fig._suptitle.get_text().strip()
-        if text:
-            name = text
+        t = fig._suptitle.get_text().strip()
+        if t:
+            return _sanitize(t)
+    try:
+        if fig.canvas.manager:
+            t = fig.canvas.manager.get_window_title().strip()
+            if t and not t.startswith('Figure '):
+                return _sanitize(t)
+    except Exception:
+        pass
+    return ''
 
-    # 2. Window title (only if user set a custom one, not the default "Figure N")
-    if not name:
-        try:
-            if fig.canvas.manager:
-                title = fig.canvas.manager.get_window_title().strip()
-                # Skip matplotlib's default "Figure N" titles
-                if title and not title.startswith('Figure '):
-                    name = title
-        except Exception:
-            pass
 
-    # 3. Fallback: figure_N
-    if not name:
-        name = f"figure_{fig.number}" if hasattr(fig, 'number') else 'figure'
-
-    # Sanitize for filesystem
-    removed = '<>:"/\\|?*\0 '
-    name = name.translate({ord(c): '_' for c in removed})
-    if not name:
-        name = 'figure'
-
-    # Auto-increment if folder already exists: ESR_sweep, ESR_sweep_1, ESR_sweep_2, …
-    candidate = base_dir / name
-    if candidate.exists():
-        counter = 1
-        while (base_dir / f"{name}_{counter}").exists():
-            counter += 1
-        candidate = base_dir / f"{name}_{counter}"
-
+def _timestamp_folder(fig) -> Path:
+    """B: plot_<YYYYMMDD_HHMMSS_ffffff>[_suptitle], collision-checked."""
+    base = _widget_save_dir
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    hint = _figure_name_hint(fig)
+    stem = f"plot_{stamp}" + (f"_{hint}" if hint else '')
+    candidate = base / stem
+    i = 1
+    while candidate.exists():       # sub-microsecond double-clicks only
+        candidate = base / f"{stem}_{i}"
+        i += 1
     return candidate
 
 
+def _write_extras(fig, folder: Path, stem: str, fmt: str, want_data, want_pickle):
+    saved = []
+    try:
+        import io as _io
+        folder.mkdir(parents=True, exist_ok=True)
+        img_path = folder / f"{stem}.{fmt}"
+        buf = _io.BytesIO()
+        (_original_savefig or _Figure.savefig)(fig, buf, format=fmt)
+        img_path.write_bytes(buf.getvalue())
+        saved.append(str(img_path))
+    except Exception as e:
+        _loud(f"image disk save failed: {e}")
+    if want_data:
+        try:
+            saved.append(str(save_plot_data(fig, folder / f"{stem}_data")))
+        except Exception as e:
+            _loud(f"data extraction failed: {e}")
+    if want_pickle:
+        p = savefig_bundle(fig, folder / stem)
+        if p is not None:
+            saved.append(str(p))
+    return saved
+
+
 def _make_patched_widget_toolbar_save():
-    """
-    Create a patched save_figure for ipympl's Toolbar.
-
-    This is the universal hook — works for ALL ipympl versions:
-      • Old (≤0.9.x): Toolbar.save_figure → send_event('save') → JS download
-      • New (0.10.0+): Toolbar.save_figure → canvas._send_save_buffer() → Python savefig
-
-    The patch:
-    1. Calls the original save_figure (browser download proceeds as normal)
-    2. ALSO writes image + .npz + .mplpkl to disk
-
-    Prints paths to the notebook output cell so the user sees what was saved.
-    """
+    """Patched ipympl Toolbar.save_figure honoring the configured widget mode."""
 
     def patched_save_figure(self, *args):
-        import io as _io
         _ensure_mpl()
         from matplotlib import rcParams
-
         fig = self.canvas.figure
 
-        # --- 1. Do the original browser download (unchanged) ---
-        if _original_widget_save is not None:
-            _original_widget_save(self, *args)
+        mode = _widget_mode
+        browser = _widget_browser_download
+        if browser is None:
+            browser = (mode == 'timestamp')   # dialog mode suppresses the dup download
 
-        # --- 2. Save extras to disk ---
-        save_path = _get_widget_save_path(fig)
-        folder = save_path
-        stem = save_path.name
-        fmt = rcParams.get('savefig.format', 'png')
-
-        saved = []
-
-        # Always save the image to disk
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            img_path = folder / f"{stem}.{fmt}"
-            buf = _io.BytesIO()
-            # Use ORIGINAL savefig to avoid triggering our Figure.savefig patch
-            if _original_savefig is not None:
-                _original_savefig(fig, buf, format=fmt)
+        # ---- mode A: local Python dialog (nothing written on cancel) ----
+        if mode == 'dialog':
+            choice = _dialog_choose_save(fig, rcParams.get('savefig.format', 'png'))
+            if choice is None:
+                return  # cancelled → no browser download, no files
+            folder, stem, fmt, want_data, want_pickle = choice
+            saved = []
+            if want_data or want_pickle:
+                _, saved = save_figure_folder(
+                    fig, folder / f"{stem}.{fmt}",
+                    save_data=want_data, save_pickle=want_pickle)
             else:
-                fig.savefig(buf, format=fmt)
-            img_path.write_bytes(buf.getvalue())
-            saved.append(str(img_path))
-        except Exception as e:
-            warnings.warn(f"mpl_figure_saver: image disk save failed: {e}")
+                folder.mkdir(parents=True, exist_ok=True)
+                (_original_savefig or _Figure.savefig)(fig, str(folder / f"{stem}.{fmt}"))
+                saved = [str(folder / f"{stem}.{fmt}")]
+            _report_saved(folder, saved)
+            return
 
-        if _prefs.get('save_data', True):
+        # ---- mode B: timestamp folder (SSH / headless) ----
+        if browser and _original_widget_save is not None:
             try:
-                npz_path = save_plot_data(fig, folder / f"{stem}_data")
-                saved.append(str(npz_path))
+                _original_widget_save(self, *args)   # browser download proceeds
             except Exception as e:
-                warnings.warn(f"mpl_figure_saver: data extraction failed: {e}")
+                _loud(f"original widget download failed: {e}")
 
-        if _prefs.get('save_pickle', True):
-            try:
-                pkl_path = savefig_bundle(fig, folder / stem)
-                saved.append(str(pkl_path))
-            except Exception as e:
-                warnings.warn(f"mpl_figure_saver: pickle save failed: {e}")
+        if _widget_save_dir is None:
+            _loud("widget_mode='timestamp' but no save directory is set. "
+                  "Nothing written to disk. Call mfs.install(save_dir=...) or "
+                  "mfs.set_save_dir(...) with an absolute path.")
+            return
 
-        if saved:
-            print(f"📁 Saved to: {folder}/")
-            for s in saved:
-                print(f"   {Path(s).name}")
+        folder = _timestamp_folder(fig)
+        fmt = rcParams.get('savefig.format', 'png')
+        saved = _write_extras(fig, folder, folder.name, fmt,
+                              _prefs.get('save_data', True),
+                              _prefs.get('save_pickle', True))
+        _report_saved(folder, saved)
 
     return patched_save_figure
 
 
-def install(*, patch_savefig: bool = True, patch_toolbar: bool = True,
-            patch_widget: bool = True):
-    """
-    Install the save patches.
+def _report_saved(folder, saved):
+    if saved:
+        print(f"📁 Saved to: {folder}")
+        for s in saved:
+            print(f"   {Path(s).name}")
 
-    Parameters
-    ----------
-    patch_savefig : bool
-        Monkey-patch Figure.savefig() to auto-create .mplpkl (default True).
-    patch_toolbar : bool
-        Monkey-patch the Qt toolbar save button to show checkboxes (default True).
-        Falls back gracefully if Qt is not the active backend.
-    patch_widget : bool
-        Monkey-patch the ipympl widget save button to also write .npz/.mplpkl
-        to disk alongside the browser download (default True).
-        Falls back gracefully if ipympl is not installed.
+
+# ---- Local save dialog for widget mode A (Qt if present, else tkinter) ----
+
+def _dialog_choose_save(fig, default_fmt):
+    """Return (folder, stem, fmt, want_data, want_pickle) or None if cancelled.
+
+    Tries a Qt dialog (if a Qt binding is importable), then tkinter. Both run
+    on the kernel's machine, so this only makes sense when the kernel has a
+    display (local or remote-desktop). On SSH use mode 'timestamp'.
+    """
+    want_data = _prefs.get('save_data', True)
+    want_pickle = _prefs.get('save_pickle', True)
+
+    # tkinter path (most portable; ships with CPython)
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk(); root.withdraw()
+        v_data = tk.BooleanVar(value=want_data)
+        v_pkl = tk.BooleanVar(value=want_pickle)
+        # A tiny options window first, then the file dialog.
+        opt = tk.Toplevel(root); opt.title("Save options")
+        tk.Checkbutton(opt, text="Also save plot data (.npz)", variable=v_data).pack(anchor='w', padx=10, pady=4)
+        tk.Checkbutton(opt, text="Also save editable figure (.mplpkl)", variable=v_pkl).pack(anchor='w', padx=10, pady=4)
+        proceed = {'ok': False}
+        tk.Button(opt, text="Choose location…",
+                  command=lambda: (proceed.update(ok=True), opt.destroy())).pack(pady=6)
+        opt.protocol("WM_DELETE_WINDOW", opt.destroy)
+        root.wait_window(opt)
+        if not proceed['ok']:
+            root.destroy(); return None
+        initial = (_widget_save_dir or Path.cwd())
+        fname = filedialog.asksaveasfilename(
+            initialdir=str(initial),
+            initialfile=(_figure_name_hint(fig) or 'figure') + f".{default_fmt}",
+            defaultextension=f".{default_fmt}",
+            filetypes=[("Image", f"*.{default_fmt}"), ("All files", "*.*")])
+        root.destroy()
+        if not fname:
+            return None
+        _prefs['save_data'] = v_data.get()
+        _prefs['save_pickle'] = v_pkl.get()
+        p = Path(fname)
+        fmt = p.suffix.lstrip('.') or default_fmt
+        return p.parent / p.stem, p.stem, fmt, v_data.get(), v_pkl.get()
+    except Exception as e:
+        _loud(f"dialog mode unavailable ({type(e).__name__}: {e}); no display? "
+              f"Use widget_mode='timestamp' on headless/SSH sessions.")
+        return None
+
+
+# ============================================================================
+#  Figure.savefig PATCH
+# ============================================================================
+
+def _patched_savefig(self, fname, *args, **kwargs):
+    """Drop-in Figure.savefig — also writes a .mplpkl (and .npz if enabled)
+    alongside. Honors the same save_data toggle as the toolbars."""
+    import io as _io
+    result = _original_savefig(self, fname, *args, **kwargs)
+    if isinstance(fname, _io.IOBase):      # widget BytesIO path handles its own
+        return result
+    try:
+        p = Path(str(fname))
+        if p.suffix == '.mplpkl':
+            return result
+        if _prefs.get('save_pickle', True):
+            savefig_bundle(self, p.with_suffix('.mplpkl'))
+        if _prefs.get('save_data', True):
+            try:
+                save_plot_data(self, p.with_suffix('.npz'))
+            except Exception as e:
+                _loud(f"auto .npz failed: {e}")
+    except Exception as e:
+        _loud(f"auto-bundle failed: {e}")
+    return result
+
+
+_patched_savefig._mfs_patched = True   # marker so re-install can't re-wrap us
+
+
+# ============================================================================
+#  INSTALL / UNINSTALL
+# ============================================================================
+
+def install(*, patch_savefig: bool = True, patch_toolbar: bool = True,
+            patch_widget: bool = True,
+            save_dir: Optional[Union[str, Path]] = None,
+            save_data: Optional[bool] = None, save_pickle: Optional[bool] = None,
+            widget_mode: Optional[str] = None,
+            widget_browser_download: Optional[bool] = None):
+    """Install the save patches and apply configuration in one call.
+
+    Configuration (save_dir / toggles / widget_mode / browser flag) is applied
+    EVERY call, even though the monkey-patching itself runs only once — so you
+    can call install(save_dir=...) again to re-point the directory mid-session.
+
+    Defaults fall back to environment variables when an argument is omitted:
+        MPL_FIG_SAVER_DIR   → save_dir
+        MPL_FIG_SAVER_MODE  → widget_mode
+
+    save_dir is REQUIRED for widget_mode='timestamp' (the SSH/headless mode);
+    without it, widget saves warn loudly and write nothing.
     """
     global _original_savefig, _original_toolbar_save, _original_widget_save, _installed
     _ensure_mpl()
 
+    # --- config first, so a re-call still takes effect past the guard below ---
+    env_mode = os.environ.get('MPL_FIG_SAVER_MODE')
+    configure(save_data=save_data, save_pickle=save_pickle,
+              widget_mode=widget_mode or env_mode,
+              widget_browser_download=widget_browser_download)
+    env_dir = os.environ.get('MPL_FIG_SAVER_DIR')
+    if save_dir is not None:
+        set_save_dir(save_dir)
+    elif env_dir and _widget_save_dir is None:
+        set_save_dir(env_dir)
+
+    if _widget_mode == 'timestamp' and _widget_save_dir is None:
+        _loud("widget_mode='timestamp' is set but no save_dir yet. Widget saves "
+              "will write nothing until you pass save_dir=... (install) or set "
+              "MPL_FIG_SAVER_DIR. Qt and fig.savefig() are unaffected.")
+
     if _installed:
         return
 
-    # --- Patch Figure.savefig ---
+    # Re-point the class at our (possibly freshly reloaded) patch while
+    # recovering the TRUE original. If the live method is already ours — module
+    # reloaded via %autoreload, or install() re-run after an edit — naively
+    # capturing it would make the patch call itself forever; so we read the real
+    # original back from the ._mfs_original attribute we stash on every patch.
+    def _true_original(live):
+        if getattr(live, '_mfs_patched', False):
+            return getattr(live, '_mfs_original', None)
+        return live
+
     if patch_savefig:
-        _original_savefig = _Figure.savefig
+        _original_savefig = _true_original(_Figure.savefig)
+        _patched_savefig._mfs_original = _original_savefig
         _Figure.savefig = _patched_savefig
 
-    # --- Patch Qt toolbar save_figure ---
     if patch_toolbar:
         try:
             from matplotlib.backends.backend_qt import NavigationToolbar2QT
-            _original_toolbar_save = NavigationToolbar2QT.save_figure
-            NavigationToolbar2QT.save_figure = _make_patched_toolbar_save(
-                NavigationToolbar2QT
-            )
+            _original_toolbar_save = _true_original(NavigationToolbar2QT.save_figure)
+            patched = _make_patched_toolbar_save(NavigationToolbar2QT)
+            patched._mfs_patched = True
+            patched._mfs_original = _original_toolbar_save
+            NavigationToolbar2QT.save_figure = patched
         except ImportError:
-            pass  # not using Qt backend — that's fine
+            pass
 
-    # --- Patch ipympl widget save ---
     if patch_widget:
         try:
             from ipympl.backend_nbagg import Toolbar as IpyToolbar
-            _original_widget_save = IpyToolbar.save_figure
-            IpyToolbar.save_figure = _make_patched_widget_toolbar_save()
+            _original_widget_save = _true_original(IpyToolbar.save_figure)
+            patched = _make_patched_widget_toolbar_save()
+            patched._mfs_patched = True
+            patched._mfs_original = _original_widget_save
+            IpyToolbar.save_figure = patched
         except ImportError:
-            pass  # ipympl not installed — that's fine
+            pass
 
     _installed = True
 
@@ -798,14 +857,11 @@ def uninstall():
     """Remove all monkey-patches."""
     global _original_savefig, _original_toolbar_save, _original_widget_save, _installed
     _ensure_mpl()
-
     if not _installed:
         return
-
     if _original_savefig is not None:
         _Figure.savefig = _original_savefig
         _original_savefig = None
-
     if _original_toolbar_save is not None:
         try:
             from matplotlib.backends.backend_qt import NavigationToolbar2QT
@@ -813,7 +869,6 @@ def uninstall():
         except ImportError:
             pass
         _original_toolbar_save = None
-
     if _original_widget_save is not None:
         try:
             from ipympl.backend_nbagg import Toolbar as IpyToolbar
@@ -821,132 +876,157 @@ def uninstall():
         except ImportError:
             pass
         _original_widget_save = None
-
     _installed = False
 
 
 # ============================================================================
-#  ExperimentResult — bundles raw data + analysis + figure in one file
+#  QT TOOLBAR PATCH
+# ============================================================================
+
+def _make_patched_toolbar_save(OrigToolbarClass):
+    """Qt save_figure with the two extra checkboxes. Fixes the v2 bug where an
+    all-unchecked save still wrote a .mplpkl: with neither box ticked, only the
+    plain image is written (original behaviour)."""
+
+    def patched_save_figure(self, *args):
+        from matplotlib.backends.qt_compat import QtWidgets
+
+        filetypes = self.canvas.get_supported_filetypes_grouped()
+        sorted_filetypes = sorted(filetypes.items())
+        default_filetype = self.canvas.get_default_filetype()
+        startpath = os.path.expanduser(_mpl.rcParams['savefig.directory'])
+        start = os.path.join(startpath, self.canvas.get_default_filename())
+
+        filters, selectedFilter = [], None
+        for name, exts in sorted_filetypes:
+            exts_list = " ".join(f'*.{e}' for e in exts)
+            filt = f'{name} ({exts_list})'
+            if default_filetype in exts:
+                selectedFilter = filt
+            filters.append(filt)
+        filters = ';;'.join(filters)
+
+        dlg = QtWidgets.QFileDialog(self.canvas.parent(), "Choose a filename to save to")
+        dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptMode.AcceptSave)
+        dlg.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setNameFilter(filters)
+        if selectedFilter:
+            dlg.selectNameFilter(selectedFilter)
+        dlg.selectFile(start)
+
+        layout = dlg.layout()
+        cb_data = cb_pickle = None
+        if layout is not None:
+            container = QtWidgets.QWidget()
+            hbox = QtWidgets.QHBoxLayout(container)
+            hbox.setContentsMargins(0, 4, 0, 0)
+            cb_data = QtWidgets.QCheckBox("Also save plot data (.npz)")
+            cb_data.setChecked(_prefs['save_data'])
+            cb_pickle = QtWidgets.QCheckBox("Also save editable figure (.mplpkl)")
+            cb_pickle.setChecked(_prefs['save_pickle'])
+            hbox.addWidget(cb_data); hbox.addSpacing(20)
+            hbox.addWidget(cb_pickle); hbox.addStretch()
+            layout.addWidget(container, layout.rowCount(), 0, 1, layout.columnCount())
+
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        fnames = dlg.selectedFiles()
+        if not fnames:
+            return None
+        fname = fnames[0]
+
+        want_data = cb_data.isChecked() if cb_data else _prefs['save_data']
+        want_pickle = cb_pickle.isChecked() if cb_pickle else _prefs['save_pickle']
+        _prefs['save_data'], _prefs['save_pickle'] = want_data, want_pickle
+
+        if startpath != "":
+            _mpl.rcParams['savefig.directory'] = os.path.dirname(fname)
+
+        try:
+            if want_data or want_pickle:
+                save_figure_folder(self.canvas.figure, fname,
+                                   save_data=want_data, save_pickle=want_pickle)
+            else:
+                # neither extra requested → plain image only, via original savefig
+                (_original_savefig or _Figure.savefig)(self.canvas.figure, fname)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Error saving file", str(e),
+                QtWidgets.QMessageBox.StandardButton.Ok,
+                QtWidgets.QMessageBox.StandardButton.NoButton)
+        return fname
+
+    return patched_save_figure
+
+
+# ============================================================================
+#  ExperimentResult
 # ============================================================================
 
 class ExperimentResult:
-    """
-    Single-file container for experimental data, analysis, and figures.
-
-    Saves as `.expr` — a gzip-compressed pickle with version-proof .npz
-    data extraction built in.
-
-    Attributes
-    ----------
-    name : str
-    params : dict          — experiment parameters (sweep ranges, settings)
-    data : dict            — named arrays / values (accessed via [])
-    figures : dict         — named matplotlib Figure objects
-    metadata : dict        — timestamps, versions, notes
-    """
+    """Single-file container for experimental data + analysis + figures (.expr).
+    SECURITY: .expr is pickle — only load trusted files."""
 
     _MAGIC = b'EXPR0002'
     _COMPRESS = 6
 
-    def __init__(self, name: str = '', *,
-                 params: Optional[dict] = None,
-                 notes: str = ''):
+    def __init__(self, name: str = '', *, params: Optional[dict] = None, notes: str = ''):
         self.name = name
         self.params = params or {}
         self.data: Dict[str, Any] = {}
         self.figures: Dict[str, Any] = {}
-        self.metadata: dict = {
-            'created': datetime.now().isoformat(),
-            'notes': notes,
-        }
+        self.metadata: dict = {'created': datetime.now().isoformat(), 'notes': notes}
 
-    # ---- data storage ---
+    def store(self, key: str, value: Any): self.data[key] = value
+    def __getitem__(self, key): return self.data[key]
+    def __contains__(self, key): return key in self.data
+    def keys(self): return self.data.keys()
+    def items(self): return self.data.items()
 
-    def store(self, key: str, value: Any):
-        """Store a named piece of data."""
-        self.data[key] = value
-
-    def __getitem__(self, key: str) -> Any:
-        return self.data[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.data
-
-    def keys(self):
-        return self.data.keys()
-
-    def items(self):
-        return self.data.items()
-
-    # ---- figures ---
-
-    def attach_figure(self, fig, name: str = 'main'):
-        """Attach a matplotlib Figure."""
-        self.figures[name] = fig
+    def attach_figure(self, fig, name: str = 'main'): self.figures[name] = fig
 
     def get_figure(self, name: str = 'main', *, show: bool = False):
-        """Retrieve an attached figure (re-binds to live canvas)."""
         _ensure_mpl()
         fig = self.figures.get(name)
         if fig is None:
             return None
         try:
-            dummy = _plt.figure()
-            _plt.close(dummy)
-            fig.set_canvas(dummy.canvas)
-            fig.canvas.manager = dummy.canvas.manager
-            fig.canvas.manager.canvas.figure = fig
-            fig.canvas.manager.set_window_title(f"{self.name} — {name}")
+            host = _plt.figure()
+            manager = host.canvas.manager
+            manager.canvas.figure = fig
+            fig.set_canvas(manager.canvas)
+            manager.set_window_title(f"{self.name} — {name}")
         except Exception:
             pass
         if show:
             fig.show()
         return fig
 
-    def get_all_figures(self) -> Dict[str, Any]:
-        return {k: self.get_figure(k) for k in self.figures}
+    def get_all_figures(self): return {k: self.get_figure(k) for k in self.figures}
 
-    # ---- replot ---
-
-    def replot(self, plot_func: Callable, *args,
-               fig_name: str = 'main', **kwargs):
-        """
-        Re-generate a figure from stored data.
-
-        plot_func(result, *args, **kwargs) → Figure
-        """
+    def replot(self, plot_func: Callable, *args, fig_name: str = 'main', **kwargs):
         fig = plot_func(self, *args, **kwargs)
         self.attach_figure(fig, fig_name)
         return fig
 
-    # ---- persistence ---
-
     def save(self, path: Union[str, Path]):
-        """Save everything to a single `.expr` file."""
         path = Path(path)
         if path.suffix not in ('.expr', '.mplpkl'):
             path = path.with_suffix('.expr')
         path.parent.mkdir(parents=True, exist_ok=True)
-
         self.metadata['saved'] = datetime.now().isoformat()
         self.metadata['numpy_version'] = np.__version__
         try:
-            _ensure_mpl()
-            self.metadata['matplotlib_version'] = _mpl.__version__
+            _ensure_mpl(); self.metadata['matplotlib_version'] = _mpl.__version__
         except Exception:
             self.metadata['matplotlib_version'] = None
-
         payload = pickle.dumps(self.__dict__, protocol=pickle.HIGHEST_PROTOCOL)
-        compressed = self._MAGIC + gzip.compress(payload, compresslevel=self._COMPRESS)
-        path.write_bytes(compressed)
-
-        size_mb = path.stat().st_size / (1024 * 1024)
-        print(f"✓ Saved: {path}  ({size_mb:.2f} MB)")
+        path.write_bytes(self._MAGIC + gzip.compress(payload, self._COMPRESS))
+        print(f"✓ Saved: {path}  ({path.stat().st_size / 1048576:.2f} MB)")
         return path
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> 'ExperimentResult':
-        """Load an `.expr` file."""
         path = Path(path)
         raw = path.read_bytes()
         if not raw.startswith(cls._MAGIC):
@@ -954,15 +1034,13 @@ class ExperimentResult:
         payload = raw[len(cls._MAGIC):]
         try:
             payload = gzip.decompress(payload)
-        except gzip.BadGzipFile:
+        except (gzip.BadGzipFile, OSError):
             pass
-        state = pickle.loads(payload)
         obj = cls.__new__(cls)
-        obj.__dict__.update(state)
+        obj.__dict__.update(pickle.loads(payload))
         return obj
 
     def savefig(self, fig=None, path: Union[str, Path] = None, *args, **kwargs):
-        """Save figure image + full .expr bundle."""
         _ensure_mpl()
         if fig is None:
             fig = self.figures.get('main')
@@ -975,30 +1053,21 @@ class ExperimentResult:
         else:
             self.save(Path(self.name.replace(' ', '_')).with_suffix('.expr'))
 
-    # ---- display ---
-
     def __repr__(self):
-        n_data = len(self.data)
-        n_figs = len(self.figures)
-        data_keys = ', '.join(list(self.data.keys())[:5])
-        if len(self.data) > 5:
-            data_keys += ', …'
-        return (f"ExperimentResult('{self.name}', "
-                f"data=[{data_keys}] ({n_data} items), "
-                f"figures={n_figs})")
+        keys = ', '.join(list(self.data.keys())[:5]) + (', …' if len(self.data) > 5 else '')
+        return (f"ExperimentResult('{self.name}', data=[{keys}] "
+                f"({len(self.data)} items), figures={len(self.figures)})")
 
     def summary(self):
-        """Print a human-readable summary of contents."""
         print(f"╔══ ExperimentResult: {self.name}")
         print(f"║  Created : {self.metadata.get('created', '?')}")
         print(f"║  Saved   : {self.metadata.get('saved', 'not yet')}")
-        print(f"║  Notes   : {self.metadata.get('notes', '')}")
-        print(f"║")
+        print(f"║  Notes   : {self.metadata.get('notes', '')}\n║")
         if self.params:
             print(f"║  Parameters ({len(self.params)}):")
             for k, v in self.params.items():
                 print(f"║    {k}: {v}")
-            print(f"║")
+            print("║")
         print(f"║  Data ({len(self.data)} items):")
         for k, v in self.data.items():
             if isinstance(v, np.ndarray):
@@ -1009,8 +1078,7 @@ class ExperimentResult:
                 print(f"║    {k}: dict ({len(v)} keys)")
             else:
                 print(f"║    {k}: {type(v).__name__} = {v}")
-        print(f"║")
-        print(f"║  Figures ({len(self.figures)}): "
+        print(f"║\n║  Figures ({len(self.figures)}): "
               f"{', '.join(self.figures.keys()) or 'none'}")
         print(f"╚{'═' * 50}")
 
@@ -1020,20 +1088,16 @@ class ExperimentResult:
 # ============================================================================
 
 def save(fig_or_result, path, **kwargs):
-    """Universal save — Figure → .mplpkl, ExperimentResult → .expr."""
     if isinstance(fig_or_result, ExperimentResult):
         return fig_or_result.save(path, **kwargs)
-    else:
-        return savefig_bundle(fig_or_result, path, **kwargs)
+    return savefig_bundle(fig_or_result, path, **kwargs)
 
 
 def load(path):
-    """Universal load — auto-detects .mplpkl vs .expr."""
     path = Path(path)
     raw = path.read_bytes()
     if raw.startswith(ExperimentResult._MAGIC):
         return ExperimentResult.load(path)
     elif raw.startswith(_MAGIC):
         return loadfig(path)
-    else:
-        raise ValueError(f"Unrecognized file format: {path}")
+    raise ValueError(f"Unrecognized file format: {path}")
