@@ -159,6 +159,11 @@ def extract_plot_data(fig) -> dict:
             'x_is_date': x_is_date, 'y_is_date': y_is_date,
             'has_legend': ax.get_legend() is not None,
             'twin_of': twin_of[ax_i], 'twin_kind': twin_kind[ax_i],
+            'subplot_geom': _subplot_geom(ax),
+            'xlabel_color': ax.xaxis.label.get_color(),
+            'ylabel_color': ax.yaxis.label.get_color(),
+            'xtick_color': _tick_color(ax.xaxis),
+            'ytick_color': _tick_color(ax.yaxis),
             'lines': [], 'scatter': [], 'images': [],
             'errorbars': [], 'bars': [], 'vlines': [], 'hlines': [],
             'texts': [], 'fills': [],
@@ -332,6 +337,29 @@ def _extract_fill(coll):
     }
 
 
+def _subplot_geom(ax):
+    """Return (nrows, ncols, start, stop) for a regular-grid axes, else None."""
+    try:
+        ss = ax.get_subplotspec()
+        if ss is None:
+            return None
+        g = ss.get_geometry()
+        return tuple(int(v) for v in g[:4])
+    except Exception:
+        return None
+
+
+def _tick_color(axis):
+    """Best-effort color of an axis' tick labels (for twinx/twiny fidelity)."""
+    try:
+        labels = axis.get_majorticklabels()
+        if labels:
+            return labels[0].get_color()
+    except Exception:
+        pass
+    return None
+
+
 def _twin_map(fig):
     """Map each axes index → (twin_of_primary_index or None, 'x'|'y'|None).
 
@@ -413,9 +441,107 @@ def save_plot_data(fig, path: Union[str, Path]):
 
 
 def load_plot_data(path: Union[str, Path]) -> dict:
-    """Load a `.npz` written by save_plot_data()."""
+    """Load the full metadata+arrays dict written by save_plot_data().
+
+    Parameters
+    ----------
+    path : str | Path
+        Path to a ``*_data.npz`` file.
+
+    Returns
+    -------
+    dict
+        The complete structure from extract_plot_data() — numeric arrays AND
+        style/layout metadata. For just the numbers, use load_arrays().
+    """
     data = np.load(str(path), allow_pickle=True)
     return data['plot_data'].item()
+
+
+def arrays_from_data(data: Union[dict, str, Path]) -> list:
+    """Strip an extract/`.npz` dict down to just the numeric arrays per axes.
+
+    Use this when you want the raw data back for further analysis and don't
+    care about styling or exact layout (the case where replot's N-row vs grid
+    layout is irrelevant). Each list item corresponds to one Axes, in the
+    order the axes were stored.
+
+    Parameters
+    ----------
+    data : dict | str | Path
+        An extract_plot_data() dict, or a path to a ``*_data.npz`` file.
+
+    Returns
+    -------
+    list[dict]
+        One dict per axes with keys: ``title, xlabel, ylabel`` and the numeric
+        collections ``lines, scatter, errorbars, bars, fills, images, vlines,
+        hlines`` — each entry carrying only arrays + its ``label``.
+
+    Examples
+    --------
+    >>> ax0 = arrays_from_data('run_data.npz')[0]
+    >>> x, y = ax0['lines'][0]['x'], ax0['lines'][0]['y']
+    """
+    if isinstance(data, (str, Path)):
+        data = load_plot_data(data)
+    out = []
+    for ad in data.get('axes', []):
+        entry = {k: ad.get(k, '') for k in ('title', 'xlabel', 'ylabel')}
+        entry['lines'] = [{'x': l['x'], 'y': l['y'], 'label': l.get('label', '')}
+                          for l in ad.get('lines', [])]
+        entry['scatter'] = [{'x': s['x'], 'y': s['y'], 'label': s.get('label', '')}
+                            for s in ad.get('scatter', [])]
+        entry['errorbars'] = [{'x': e['x'], 'y': e['y'], 'xerr': e.get('xerr'),
+                               'yerr': e.get('yerr'), 'label': e.get('label', '')}
+                              for e in ad.get('errorbars', [])]
+        entry['bars'] = [{'x': b['x'], 'heights': b['heights'],
+                          'widths': b['widths'], 'label': b.get('label', '')}
+                         for b in ad.get('bars', [])]
+        entry['fills'] = [{'t': f['t'], 'lo': f['lo'], 'hi': f['hi'],
+                           'orient': f['orient'], 'label': f.get('label', '')}
+                          for f in ad.get('fills', [])]
+        entry['images'] = [{'data': im['data'], 'extent': im.get('extent')}
+                           for im in ad.get('images', [])]
+        entry['vlines'] = [{'x': v['x']} for v in ad.get('vlines', [])]
+        entry['hlines'] = [{'y': h['y']} for h in ad.get('hlines', [])]
+        out.append(entry)
+    return out
+
+
+def load_arrays(path: Union[str, Path]) -> list:
+    """Convenience: arrays_from_data(load_plot_data(path)).
+
+    Returns just the numeric arrays per axes (see arrays_from_data), leaving
+    the full style/layout metadata in load_plot_data() for those who want it.
+    """
+    return arrays_from_data(load_plot_data(path))
+
+
+def fix_vscode_widget_style():
+    """Make %matplotlib widget figures theme-correctly inside VS Code.
+
+    Injects CSS so the ipywidgets container is transparent (no hard-coded white
+    box in dark themes) and widget text/labels follow VS Code's editor colors.
+    No-op outside an IPython display context. Call once per notebook, e.g. right
+    after mfs.install().
+    """
+    try:
+        from IPython.display import display, HTML
+    except Exception:
+        return
+    display(HTML(
+        "<style>"
+        ".cell-output-ipywidget-background{background-color:transparent !important;}"
+        ".jp-OutputArea-output{background-color:transparent !important;}"
+        ":root{"
+        "--jp-widgets-color:var(--vscode-editor-foreground);"
+        "--jp-widgets-label-color:var(--vscode-editor-foreground);"
+        "--jp-widgets-font-size:var(--vscode-editor-font-size);"
+        "}"
+        ".lm-Widget,.jupyter-widgets{color:var(--vscode-editor-foreground);}"
+        "</style>"
+    ))
 
 
 # ============================================================================
@@ -423,14 +549,27 @@ def load_plot_data(path: Union[str, Path]) -> dict:
 # ============================================================================
 
 def replot_from_data(data: Union[dict, str, Path], *, show: bool = False):
-    """Rebuild a figure from an extract_plot_data() dict or a .npz path.
+    """Rebuild a Figure from extracted ARRAYS (no pickle) — version-proof.
 
-    Reconstructs the common, round-trippable content (lines, scatter,
-    errorbars, bars, images, axvline/axhline, text, scales, labels, limits,
-    legend, figure size, fill_between/fill_betweenx, and twinx/twiny axes).
-    Does NOT reconstruct pcolormesh/contour or arbitrary subplot grid geometry
-    (primaries are laid out as an N-row column) — use loadfig() on the .mplpkl
-    when you need those back exactly.
+    Reconstructs lines, scatter, errorbars, bars, images, axvline/axhline,
+    text, fill_between/fill_betweenx (incl. where= gaps), scales, labels,
+    limits, legend, label/tick colors, figure size, and twinx/twiny axes.
+    Regular subplot grids (e.g. 2x2) are rebuilt from stored geometry; an
+    irregular gridspec falls back to an N-row column. Does NOT reconstruct
+    pcolormesh/contour/stackplot — use loadfig() on the .mplpkl for a
+    pixel-faithful copy.
+
+    Parameters
+    ----------
+    data : dict | str | Path
+        An extract_plot_data() dict, or a path to a ``*_data.npz`` file.
+    show : bool, default False
+        If True, call fig.show() before returning.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        A freshly built figure. (For the raw arrays alone, see load_arrays.)
     """
     _ensure_mpl()
     import matplotlib.dates as mdates
@@ -439,16 +578,35 @@ def replot_from_data(data: Union[dict, str, Path], *, show: bool = False):
         data = load_plot_data(data)
 
     all_axes = data.get('axes', [])
-    # Primaries get their own subplot row; twins attach to their primary.
+    # Primaries get a cell; twins attach to their primary.
     primaries = [i for i, ad in enumerate(all_axes) if ad.get('twin_of') is None]
-    n = max(1, len(primaries))
     figsize = data.get('figsize') or None
-    fig, axs = _plt.subplots(n, 1, figsize=figsize, squeeze=False)
-    axs = axs.ravel()
 
+    # If every primary reports the same regular (nrows, ncols) grid with a
+    # single-cell span, rebuild that grid (so a 2x2 comes back as a 2x2).
+    # Otherwise fall back to an N-row column.
+    geoms = [all_axes[i].get('subplot_geom') for i in primaries]
     axmap = {}                                   # data-index → live Axes
-    for row, i in enumerate(primaries):
-        axmap[i] = axs[row]
+    use_grid = (len(primaries) > 0 and all(g is not None for g in geoms)
+                and len({(g[0], g[1]) for g in geoms}) == 1
+                and all(g[2] == g[3] for g in geoms))
+    if use_grid:
+        nrows, ncols = geoms[0][0], geoms[0][1]
+        fig, axs2d = _plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+        flat = axs2d.ravel()
+        used = set()
+        for i, g in zip(primaries, geoms):
+            axmap[i] = flat[g[2]]
+            used.add(g[2])
+        for k, a in enumerate(flat):             # drop unused empty cells
+            if k not in used:
+                a.remove()
+    else:
+        n = max(1, len(primaries))
+        fig, axs = _plt.subplots(n, 1, figsize=figsize, squeeze=False)
+        axs = axs.ravel()
+        for row, i in enumerate(primaries):
+            axmap[i] = axs[row]
     for i, ad in enumerate(all_axes):            # create twins on their primary
         if ad.get('twin_of') is not None:
             base = axmap.get(ad['twin_of'])
@@ -526,8 +684,12 @@ def _draw_axes(ax, ad, mdates):
     if ad.get('yscale'):
         ax.set_yscale(ad['yscale'])
     ax.set_title(ad.get('title', ''))
-    ax.set_xlabel(ad.get('xlabel', ''))
-    ax.set_ylabel(ad.get('ylabel', ''))
+    ax.set_xlabel(ad.get('xlabel', ''), color=ad.get('xlabel_color') or 'black')
+    ax.set_ylabel(ad.get('ylabel', ''), color=ad.get('ylabel_color') or 'black')
+    if ad.get('xtick_color'):
+        ax.tick_params(axis='x', labelcolor=ad['xtick_color'])
+    if ad.get('ytick_color'):
+        ax.tick_params(axis='y', labelcolor=ad['ytick_color'])
     try:
         ax.set_xlim(ad['xlim']); ax.set_ylim(ad['ylim'])
     except Exception:
@@ -548,11 +710,31 @@ _COMPRESSION_LEVEL = 6
 
 def savefig_bundle(fig, path: Union[str, Path], *, compress: bool = True,
                    extra_data: Optional[dict] = None):
-    """Save a Figure to a re-openable `.mplpkl`.
+    """Save a Figure to a re-openable `.mplpkl` pickle bundle.
 
     If the figure contains an unpicklable artist (e.g. a lambda tick
     formatter), the pickle is skipped with a loud warning rather than
     silently dying — the .npz remains your safety net.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        The figure to serialize.
+    path : str | Path
+        Output path; the ``.mplpkl`` suffix is enforced.
+    compress : bool, default True
+        gzip the pickle payload (smaller files, negligible load cost).
+    extra_data : dict | None
+        Arbitrary picklable metadata to store alongside the figure and get
+        back as the second return value of loadfig() — e.g.
+        ``extra_data={'temperature_K': 4.2, 'popt': fit_params}``. This is the
+        ONLY thing that populates loadfig()'s ``extra_data``; nothing is added
+        automatically.
+
+    Returns
+    -------
+    Path | None
+        The written path, or None if pickling failed (warning emitted).
     """
     _ensure_mpl()
     path = Path(path).with_suffix('.mplpkl')
@@ -577,9 +759,33 @@ def savefig_bundle(fig, path: Union[str, Path], *, compress: bool = True,
 
 
 def loadfig(path: Union[str, Path], *, show: bool = False):
-    """Load a `.mplpkl` → (fig, extra_data), re-bound to a live pyplot canvas.
+    """Load a `.mplpkl` into a live, editable matplotlib Figure.
 
-    Warns if the loading matplotlib version differs from the saving one.
+    The figure is re-bound to a fresh pyplot-managed canvas so plt.show() and
+    interactive editing work. Preserves the ORIGINAL layout exactly (grids,
+    gridspec, twins, colors) — unlike replot_from_data(), which rebuilds from
+    arrays. Warns if the loading matplotlib differs from the saving version.
+
+    Parameters
+    ----------
+    path : str | Path
+        Path to a ``.mplpkl`` file.
+    show : bool, default False
+        If True, call fig.show() before returning.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The reconstructed figure.
+    extra_data : dict
+        Whatever was passed as ``extra_data=`` to savefig_bundle() when the
+        file was written — a free-form, user-supplied metadata dict (fit
+        parameters, instrument settings, ...). Empty ``{}`` for files produced
+        by the automatic toolbar / savefig paths, which don't set it.
+
+    Security
+    --------
+    Uses pickle — only load files you trust; unpickling runs arbitrary code.
     """
     _ensure_mpl()
     path = Path(path)
@@ -921,16 +1127,54 @@ def install(*, patch_savefig: bool = True, patch_toolbar: bool = True,
             widget_browser_download: Optional[bool] = None):
     """Install the save patches and apply configuration in one call.
 
-    Configuration (save_dir / toggles / widget_mode / browser flag) is applied
-    EVERY call, even though the monkey-patching itself runs only once — so you
-    can call install(save_dir=...) again to re-point the directory mid-session.
+    The monkey-patching of Figure.savefig and the Qt/ipympl toolbars runs once,
+    but the configuration below is (re)applied on EVERY call, so you may call
+    install(save_dir=...) again mid-session to re-point the directory or switch
+    mode. Safe under %autoreload: re-running never double-wraps the patches.
 
-    Defaults fall back to environment variables when an argument is omitted:
-        MPL_FIG_SAVER_DIR   → save_dir
-        MPL_FIG_SAVER_MODE  → widget_mode
+    Parameters
+    ----------
+    patch_savefig : bool, default True
+        Patch matplotlib.figure.Figure.savefig so it also writes the
+        sidecar .mplpkl / .npz next to every image you save in code.
+    patch_toolbar : bool, default True
+        Patch the Qt NavigationToolbar "Save" button (adds the two checkboxes).
+        Silently skipped if no Qt backend is importable.
+    patch_widget : bool, default True
+        Patch the ipympl (%matplotlib widget) toolbar "Save" button.
+        Silently skipped if ipympl is not installed.
+    save_dir : str | Path | None
+        Directory for widget 'timestamp'-mode saves. Resolved to an absolute
+        path immediately (a later os.chdir can't move it) and created if
+        missing. REQUIRED for widget_mode='timestamp'; without it those saves
+        warn loudly and write nothing. Falls back to $MPL_FIG_SAVER_DIR.
+    save_data : bool | None, default True
+        Whether every save also writes the version-proof ``*_data.npz``.
+        None leaves the current setting unchanged.
+    save_pickle : bool | None, default True
+        Whether every save also writes the quick-reopen ``.mplpkl``.
+        None leaves the current setting unchanged.
+    widget_mode : {'timestamp', 'dialog'} | None
+        How the ipympl "Save" button behaves:
+          'timestamp' — write ``plot_<timestamp>[_suptitle]/`` into save_dir
+                         (works headless / over SSH; the browser download, if
+                         any, still happens). This is the default.
+          'dialog'    — open a local Python save dialog on the kernel's machine
+                         (local or remote-desktop only); nothing is written if
+                         you cancel. Falls back to $MPL_FIG_SAVER_MODE.
+    widget_browser_download : bool | None
+        Force the ipympl browser download on/off. None = auto: on for
+        'timestamp', off for 'dialog' (so you don't get two dialogs).
 
-    save_dir is REQUIRED for widget_mode='timestamp' (the SSH/headless mode);
-    without it, widget saves warn loudly and write nothing.
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> import mpl_figure_saver as mfs
+    >>> mfs.install(save_dir='/data/figs', widget_mode='timestamp')   # SSH box
+    >>> mfs.install(widget_mode='dialog')                             # laptop
     """
     global _original_savefig, _original_toolbar_save, _original_widget_save, _installed
     _ensure_mpl()
