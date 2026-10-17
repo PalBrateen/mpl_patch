@@ -9,14 +9,14 @@ after the analysis has scrolled off your screen.
 |------|------------|-------------|-------------------------------|
 | `plot.png` / `.pdf` / … | the image you asked for | — | — |
 | `plot.mplpkl` | pickle of the **exact** figure | `loadfig()` | ✗ (pickle) |
-| `plot_data.npz` | the **arrays** behind every artist | `replot_from_data()` / `load_arrays()` | ✓ |
+| `plot.mplscene` | JSON scene tree + **arrays** (no pickle) | `replot_scene()` / `read_data()` | ✓ |
 
 The pickle gives you a fast, pixel-perfect reopen; the `.npz` is a version-proof
 fallback (plain NumPy) that can rebuild the figure or just hand back the numbers.
 
 ## Install
 
-Drop `mpl_figure_saver.py` next to your code (single file, no install step).
+Drop `mpl_figure_saver.py` **and** `mpl_scene.py` next to your code (no install step).
 Requires `numpy` and `matplotlib`; `ipympl` only if you use `%matplotlib widget`.
 
 ```python
@@ -39,10 +39,13 @@ ax.plot(x, np.sin(x), label="sin")
 ax.legend()
 fig.savefig("figs/sine.png")          # also writes sine.mplpkl + sine_data.npz
 
-fig2, extra = mfs.loadfig("figs/sine.mplpkl")   # exact, editable figure
-fig3 = mfs.replot_from_data("figs/sine_data.npz")  # version-proof rebuild
-for s in mfs.get_series("figs/sine_data.npz")[0]:      # uniform x/y per item
-    plt.plot(s["x"], s["y"], label=s["label"])
+fig2, extra = mfs.loadfig("figs/sine.mplpkl")      # exact, editable figure
+fig3 = mfs.replot_scene("figs/sine.mplscene")      # version-proof rebuild
+
+d = mfs.read_data("figs/sine.mplscene")            # queryable data view
+d.labels                                           # ['sin']
+x, y = d["sin"]                                    # index by label, unpack
+d.to_csv("sine.csv")                               # or d.to_dataframe()
 ```
 
 See **`demo_mpl_figure_saver.ipynb`** (or run `python demo_mpl_figure_saver.py`)
@@ -66,13 +69,31 @@ widget` figures follow your theme instead of rendering on a white box.
 
 ## What round-trips through the `.npz`
 
-Reconstructed by `replot_from_data()`: lines (labeled *or* not), scatter,
-errorbars, bars, images, `axvline`/`axhline`, text, scales, limits, legend,
-label/tick colors, figure size, **`fill_between`/`fill_betweenx`** (incl.
-`where=` gaps), **`twinx`/`twiny`**, and regular subplot grids (e.g. 2×2).
+v4 walks the artist tree **generically** instead of hand-coding each plot type,
+so coverage is no longer a per-type allowlist. Verified pixel-identical on a
+14-figure battery: lines, scatter, errorbars, bars, images, **`pcolormesh`**,
+**`contourf`**, **`stackplot`**, `fill_between`, log scales, `twinx`/`twiny`,
+2×2 grids, `axvline`/`axhline`/text, and minor-tick grids.
 
-Not reconstructed from arrays (use `loadfig()` on the `.mplpkl` for these):
-`pcolormesh`/contour/stackplot and irregular `gridspec` layouts.
+Known gaps: 3D axes, colorbars, polar projections, and custom `FuncFormatter`
+lambdas (these degrade with a warning, never silently). Some artists come back
+as an equivalent class (e.g. a filled contour as a `PathCollection`) — visually
+identical, reported in the scene's `report` field. For a byte-exact copy on the
+same matplotlib version, use `loadfig()` on the `.mplpkl`.
+
+### Getting your data back
+
+`read_data()` returns a queryable view — the part MATLAB's `.fig` has no API for:
+
+```python
+d = mfs.read_data("run.mplscene")
+d.labels                      # ['signal', 'band', 'pts']
+x, y = d["signal"]            # index by label, unpacks to arrays
+d["band"].hi                  # kind-specific extras (lo/hi, xerr/yerr, sizes)
+d.of_kind("fill")             # filter
+d.to_csv("run.csv"); d.to_dataframe()
+d["signal"].plot(ax)          # re-draw one series anywhere
+```
 
 ## `ExperimentResult`
 
@@ -89,7 +110,11 @@ r = mfs.ExperimentResult.load("esr_042.expr")
 ## Security
 
 `.mplpkl` and `.expr` use `pickle` — **only load files you trust**, since
-unpickling runs arbitrary code. The `.npz` is plain arrays and always safe.
+unpickling runs arbitrary code.
+
+`.mplscene` contains **no pickle**: a JSON tree plus arrays loaded with
+`allow_pickle=False`. It is safe to open from any source, and readable from
+any language. (v3's `.npz` did require `allow_pickle=True` — that is fixed.)
 
 ## License
 

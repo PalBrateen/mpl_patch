@@ -1,5 +1,5 @@
 """
-mpl_figure_saver.py — MATLAB-like .fig saving for matplotlib (v3)
+mpl_figure_saver.py — MATLAB-like .fig saving for matplotlib (v4)
 ==================================================================
 
 Patches the matplotlib "Save" button and fig.savefig() so every save also
@@ -19,7 +19,7 @@ Each save produces (subject to the save_data / save_pickle toggles):
 
     <name>/
       ├── <name>.<fmt>         ← image in the requested/rc format   (always)
-      ├── <name>_data.npz      ← arrays extracted from every axes   (save_data)
+      ├── <name>.mplscene      ← JSON scene + arrays, NO pickle      (save_data)
       └── <name>.mplpkl        ← pickle bundle for quick reopen      (save_pickle)
 
 Quick start
@@ -41,8 +41,9 @@ Environment defaults (per machine, so one notebook runs everywhere):
 Reopen / replot
 ---------------
     fig, extra = mfs.loadfig('plot_.../plot_....mplpkl')   # pickle → editable figure
-    data = mfs.load_plot_data('plot_.../plot_..._data.npz')
-    fig  = mfs.replot_from_data(data)                      # rebuild from arrays
+    fig  = mfs.replot_scene('plot_.../plot_....mplscene')  # pickle-free rebuild
+    d    = mfs.read_data('plot_.../plot_....mplscene')     # queryable data view
+    x, y = d['signal']                                     # by label, unpacked
 
 ExperimentResult (bundle raw data + analysis + figure in one .expr):
     from mpl_figure_saver import ExperimentResult
@@ -51,8 +52,9 @@ ExperimentResult (bundle raw data + analysis + figure in one .expr):
     r.save('esr_042.expr')
     r = ExperimentResult.load('esr_042.expr')
 
-SECURITY: .mplpkl / .expr use pickle. Only load files you trust — unpickling
-runs arbitrary code. The .npz is plain arrays and is always safe to load.
+SECURITY: .mplpkl / .expr use pickle — only load files you trust, since
+unpickling runs arbitrary code. The .mplscene file contains NO pickle (JSON +
+arrays loaded with allow_pickle=False) and is safe to load from any source.
 
 Author : Claude / BP Lab   •   Date: 2026-04 → rev 2026-10   •   License: MIT
 """
@@ -68,6 +70,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Union
 
 import numpy as np
+
+import mpl_scene as _scene
 
 # ---------------------------------------------------------------------------
 # Lazy matplotlib import — don't force a backend at import time
@@ -102,676 +106,98 @@ def _loud(msg: str):
 
 
 # ============================================================================
-#  DATA EXTRACTION
+#  DATA / SCENE  (delegates to mpl_scene: generic artist walk, no pickle)
 # ============================================================================
+#
+# v3 hand-wrote an extractor per plot type, which meant every unsupported type
+# was silent data loss. v4 walks the artist tree generically (mpl_scene) and
+# stores a JSON scene + raw arrays in a .mplscene zip. Nothing in that file is
+# pickled, so it loads with allow_pickle=False and is readable from any
+# language.
 
-def extract_plot_data(fig) -> dict:
-    """Walk every Axes in `fig` and pull out the underlying numeric data.
+SCENE_EXT = ".mplscene"
 
-    Captured (round-trippable by replot_from_data): figure size, suptitle; per
-    axes the title/labels/limits/scales, a date flag, lines (labeled OR not),
-    scatter, errorbars, bars, images, vertical/horizontal reference lines
-    (axvline/axhline), standalone text, and whether a legend was shown.
 
-    Also captured: fill_between / fill_betweenx (source arrays reconstructed
-    from the polygon, including where= gaps) and twinx/twiny relationships.
+def save_scene_file(fig, path):
+    """Write the version-proof scene file (JSON tree + arrays, no pickle).
 
-    NOT captured as source arrays (pickle still preserves them visually):
-    stackplot, pcolormesh / contour (QuadMesh), and annotation arrows.
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    path : str | Path
+        Output path; the ``.mplscene`` suffix is enforced.
+
+    Returns
+    -------
+    Path
     """
-    _ensure_mpl()
-    import matplotlib.dates as mdates
-    from matplotlib.collections import PathCollection
-    from matplotlib.container import ErrorbarContainer, BarContainer
-
-    result = {
-        'format_version': 3,
-        'figsize': tuple(float(v) for v in fig.get_size_inches()),
-        'suptitle': fig._suptitle.get_text() if fig._suptitle else '',
-        'axes': [],
-    }
-
-    twin_of, twin_kind = _twin_map(fig)
-
-    for ax_i, ax in enumerate(fig.axes):
-        xaxis_tr = ax.get_xaxis_transform()
-        yaxis_tr = ax.get_yaxis_transform()
-
-        # Detect date axes so we can store numeric values + a flag.
-        def _is_date(axis):
-            conv = axis.get_converter() if hasattr(axis, 'get_converter') else None
-            return isinstance(conv, mdates.DateConverter) or \
-                isinstance(conv, getattr(mdates, '_SwitchableDateConverter', ()))
-        x_is_date = _is_date(ax.xaxis)
-        y_is_date = _is_date(ax.yaxis)
-
-        def _num(vals, is_date):
-            if is_date:
-                return np.asarray(mdates.date2num(vals), dtype=np.float64)
-            return np.asarray(vals, dtype=np.float64)
-
-        ax_data = {
-            'title': ax.get_title(),
-            'xlabel': ax.get_xlabel(), 'ylabel': ax.get_ylabel(),
-            'xscale': ax.get_xscale(), 'yscale': ax.get_yscale(),
-            'xlim': tuple(float(v) for v in ax.get_xlim()),
-            'ylim': tuple(float(v) for v in ax.get_ylim()),
-            'x_is_date': x_is_date, 'y_is_date': y_is_date,
-            'has_legend': ax.get_legend() is not None,
-            'twin_of': twin_of[ax_i], 'twin_kind': twin_kind[ax_i],
-            'subplot_geom': _subplot_geom(ax),
-            'xlabel_color': ax.xaxis.label.get_color(),
-            'ylabel_color': ax.yaxis.label.get_color(),
-            'xtick_color': _tick_color(ax.xaxis),
-            'ytick_color': _tick_color(ax.yaxis),
-            'lines': [], 'scatter': [], 'images': [],
-            'errorbars': [], 'bars': [], 'vlines': [], 'hlines': [],
-            'texts': [], 'fills': [],
-        }
-
-        # --- Errorbar / bar containers (first, to tag errorbar lines) ---
-        errorbar_line_ids = set()
-        for cont in getattr(ax, 'containers', []):
-            if isinstance(cont, ErrorbarContainer):
-                data_line = cont[0]
-                if data_line is not None:
-                    errorbar_line_ids.add(id(data_line))
-                    ax_data['errorbars'].append({
-                        'x': _num(data_line.get_xdata(), x_is_date),
-                        'y': _num(data_line.get_ydata(), y_is_date),
-                        'yerr': _extract_errorbar_err(cont, 'y'),
-                        'xerr': _extract_errorbar_err(cont, 'x'),
-                        'label': data_line.get_label(),
-                    })
-            elif isinstance(cont, BarContainer):
-                patches = cont.patches
-                if patches:
-                    ax_data['bars'].append({
-                        'x': np.array([p.get_x() for p in patches]),
-                        'heights': np.array([p.get_height() for p in patches]),
-                        'widths': np.array([p.get_width() for p in patches]),
-                        'label': cont.get_label(),
-                    })
-
-        # --- Lines: data lines (kept even if unlabeled) vs axvline/axhline ---
-        for line in ax.get_lines():
-            if id(line) in errorbar_line_ids:
-                continue
-            tr = line.get_transform()
-            if tr is xaxis_tr:                       # axvline
-                xd = np.asarray(line.get_xdata(), dtype=np.float64)
-                ax_data['vlines'].append({
-                    'x': float(xd[0]) if xd.size else np.nan,
-                    'color': line.get_color(), 'linestyle': line.get_linestyle(),
-                    'linewidth': line.get_linewidth(), 'label': line.get_label(),
-                })
-                continue
-            if tr is yaxis_tr:                        # axhline
-                yd = np.asarray(line.get_ydata(), dtype=np.float64)
-                ax_data['hlines'].append({
-                    'y': float(yd[0]) if yd.size else np.nan,
-                    'color': line.get_color(), 'linestyle': line.get_linestyle(),
-                    'linewidth': line.get_linewidth(), 'label': line.get_label(),
-                })
-                continue
-            label = line.get_label()
-            ax_data['lines'].append({
-                'x': _num(line.get_xdata(), x_is_date),
-                'y': _num(line.get_ydata(), y_is_date),
-                # auto labels like "_child0" become '' so replot won't legend them
-                'label': '' if label.startswith('_') else label,
-                'color': line.get_color(), 'linestyle': line.get_linestyle(),
-                'linewidth': line.get_linewidth(), 'marker': line.get_marker(),
-            })
-
-        # --- Scatter (PathCollection) ---
-        for coll in ax.collections:
-            if isinstance(coll, PathCollection):
-                offsets = np.asarray(coll.get_offsets(), dtype=np.float64)
-                if offsets.size == 0:
-                    continue
-                label = coll.get_label()
-                entry = {
-                    'x': offsets[:, 0], 'y': offsets[:, 1],
-                    'label': '' if label.startswith('_') else label,
-                }
-                fc = coll.get_facecolors()
-                if fc is not None and len(fc) > 1:
-                    entry['facecolors'] = np.asarray(fc)
-                sizes = coll.get_sizes()
-                if sizes is not None and len(sizes) > 1:
-                    entry['sizes'] = np.asarray(sizes)
-                ax_data['scatter'].append(entry)
-
-        # --- fill_between / fill_betweenx ---
-        for coll in ax.collections:
-            if getattr(coll, 't_direction', None) is not None:
-                fb = _extract_fill(coll)
-                if fb is not None:
-                    ax_data['fills'].append(fb)
-
-        # --- Images (imshow) ---
-        for img_obj in ax.get_images():
-            ax_data['images'].append({
-                'data': np.asarray(img_obj.get_array()),
-                'extent': img_obj.get_extent(),
-                'cmap': img_obj.get_cmap().name if img_obj.get_cmap() else None,
-                'clim': img_obj.get_clim(),
-                'aspect': ax.get_aspect(),
-            })
-
-        # --- Standalone text / annotation text ---
-        for t in ax.texts:
-            s = t.get_text()
-            if not s:
-                continue
-            ax_data['texts'].append({
-                'text': s,
-                'xy': tuple(float(v) for v in t.get_position()),
-                'color': t.get_color(),
-            })
-
-        result['axes'].append(ax_data)
-
-    return result
-
-
-def _extract_fill(coll):
-    """Reconstruct fill_between / fill_betweenx source arrays from a
-    FillBetweenPolyCollection's polygon path(s).
-
-    Returns a dict {orient, t, lo, hi, facecolor, alpha, label} or None.
-    orient 'v' → replot with fill_between(t, lo, hi);
-    orient 'h' → replot with fill_betweenx(t, lo, hi).
-    Multiple polygons (from where=) are concatenated with NaN gaps.
-    """
-    _ensure_mpl()
-    from matplotlib.path import Path as _Path
-
-    t_dir = getattr(coll, 't_direction', None)   # 'x' vertical, 'y' horizontal
-    if t_dir is None:
-        return None  # not a fill_between collection (older mpl: not supported)
-    orient = 'v' if t_dir == 'x' else 'h'
-
-    t_all, lo_all, hi_all = [], [], []
-    for path in coll.get_paths():
-        v = path.vertices
-        codes = path.codes
-        if codes is not None:
-            v = v[codes != _Path.CLOSEPOLY]
-        if len(v) < 4:
-            continue
-        n = (len(v) - 2) // 2
-        if n < 1:
-            continue
-        lower = v[1:1 + n]            # (indep, boundary-1)
-        upper = v[1 + n + 1:1 + n + 1 + n][::-1]   # reversed (indep, boundary-2)
-        if len(upper) != n:
-            continue
-        if orient == 'v':
-            t, lo = lower[:, 0], lower[:, 1]
-            hi = upper[:, 1]
-        else:                          # horizontal: independent var is y
-            t, lo = lower[:, 1], lower[:, 0]
-            hi = upper[:, 0]
-        if t_all:                      # NaN gap between where-segments
-            t_all.append([np.nan]); lo_all.append([np.nan]); hi_all.append([np.nan])
-        t_all.append(t); lo_all.append(lo); hi_all.append(hi)
-
-    if not t_all:
-        return None
-    try:
-        fc = coll.get_facecolor()
-        facecolor = np.asarray(fc[0]).tolist() if fc is not None and len(fc) else None
-    except Exception:
-        facecolor = None
-    label = coll.get_label()
-    return {
-        'orient': orient,
-        't': np.concatenate(t_all),
-        'lo': np.concatenate(lo_all),
-        'hi': np.concatenate(hi_all),
-        'facecolor': facecolor,
-        'alpha': coll.get_alpha(),
-        'label': '' if (label or '').startswith('_') else label,
-    }
-
-
-def _subplot_geom(ax):
-    """Return (nrows, ncols, start, stop) for a regular-grid axes, else None."""
-    try:
-        ss = ax.get_subplotspec()
-        if ss is None:
-            return None
-        g = ss.get_geometry()
-        return tuple(int(v) for v in g[:4])
-    except Exception:
-        return None
-
-
-def _tick_color(axis):
-    """Best-effort color of an axis' tick labels (for twinx/twiny fidelity)."""
-    try:
-        labels = axis.get_majorticklabels()
-        if labels:
-            return labels[0].get_color()
-    except Exception:
-        pass
-    return None
-
-
-def _twin_map(fig):
-    """Map each axes index → (twin_of_primary_index or None, 'x'|'y'|None).
-
-    A twinx shares the x-axis; a twiny shares the y-axis. The earliest axes in
-    a twinned group is treated as the primary.
-    """
-    axes = fig.axes
-    twin_of = [None] * len(axes)
-    kind = [None] * len(axes)
-    gx = axes[0].get_shared_x_axes() if axes else None
-    gy = axes[0].get_shared_y_axes() if axes else None
-    for i, ax in enumerate(axes):
-        sibs = None
-        grp = getattr(ax, '_twinned_axes', None)
-        if grp is not None:
-            try:
-                sibs = [axes.index(s) for s in grp.get_siblings(ax) if s in axes]
-            except Exception:
-                sibs = None
-        if not sibs or len(sibs) < 2:
-            continue
-        primary = min(sibs)
-        if i == primary:
-            continue
-        p_ax = axes[primary]
-        shares_x = gx.joined(ax, p_ax) if gx else False
-        shares_y = gy.joined(ax, p_ax) if gy else False
-        if shares_x and not shares_y:
-            twin_of[i], kind[i] = primary, 'x'
-        elif shares_y and not shares_x:
-            twin_of[i], kind[i] = primary, 'y'
-    return twin_of, kind
-
-
-def _extract_errorbar_err(container, axis='y'):
-    """Extract error magnitudes from an ErrorbarContainer, or None if that
-    axis has no error bars (so an xerr-only plot reports yerr=None, not zeros)."""
-    barlines = container[2]
-    if not barlines:
-        return None
-    data_line = container[0]
-    data_vals = np.asarray(
-        data_line.get_ydata() if axis == 'y' else data_line.get_xdata(),
-        dtype=np.float64,
-    )
-    try:
-        # Heuristic layout of the bar LineCollections:
-        #   yerr only            -> [y]
-        #   xerr only            -> [x]
-        #   both (xerr, yerr)    -> [x, y]
-        if len(barlines) >= 2:
-            bc = barlines[1] if axis == 'y' else barlines[0]
-        else:
-            bc = barlines[0]
-        segments = bc.get_segments()
-        if not segments:
-            return None
-        comp = 1 if axis == 'y' else 0
-        # A y-error collection has segments that vary in y; if this collection
-        # is actually the other axis, its chosen component won't vary -> None.
-        lo = np.array([seg[0][comp] for seg in segments], dtype=np.float64)
-        hi = np.array([seg[1][comp] for seg in segments], dtype=np.float64)
-        if np.allclose(lo, hi):
-            return None
-        return np.column_stack([data_vals - lo, hi - data_vals])
-    except Exception:
-        return None
-
-
-def save_plot_data(fig, path: Union[str, Path]):
-    """Extract all numeric data from `fig` → compressed `.npz`.
-
-    Load with load_plot_data(), or:
-        d = np.load('x.npz', allow_pickle=True)['plot_data'].item()
-    """
-    path = Path(path).with_suffix('.npz')
-    np.savez_compressed(str(path), plot_data=extract_plot_data(fig))
+    path = Path(path).with_suffix(SCENE_EXT)
+    _scene.save_scene(fig, str(path))
     return path
 
 
-def load_plot_data(path: Union[str, Path]) -> dict:
-    """Load the full metadata+arrays dict written by save_plot_data().
+def load_scene_file(path):
+    """Load a ``.mplscene`` -> (tree, arrays). Mostly for inspection."""
+    return _scene.load_scene(str(path))
+
+
+def replot_scene(path_or_tree, arrays=None, *, show=False):
+    """Rebuild a Figure from a ``.mplscene`` file (version-proof path).
+
+    Unlike loadfig() this uses no pickle: the figure is reconstructed by
+    replaying artists and properties. Covers lines, scatter, errorbars, bars,
+    fills, images, pcolormesh, contours, twins, grids, legends, annotations.
 
     Parameters
     ----------
-    path : str | Path
-        Path to a ``*_data.npz`` file.
-
-    Returns
-    -------
-    dict
-        The complete structure from extract_plot_data() — numeric arrays AND
-        style/layout metadata. For just the numbers, use load_arrays().
-    """
-    data = np.load(str(path), allow_pickle=True)
-    return data['plot_data'].item()
-
-
-def arrays_from_data(data: Union[dict, str, Path]) -> list:
-    """Strip an extract/`.npz` dict down to just the numeric arrays per axes.
-
-    Use this when you want the raw data back for further analysis and don't
-    care about styling or exact layout (the case where replot's N-row vs grid
-    layout is irrelevant). Each list item corresponds to one Axes, in the
-    order the axes were stored.
-
-    Parameters
-    ----------
-    data : dict | str | Path
-        An extract_plot_data() dict, or a path to a ``*_data.npz`` file.
-
-    Returns
-    -------
-    list[dict]
-        One dict per axes with keys: ``title, xlabel, ylabel`` and the numeric
-        collections ``lines, scatter, errorbars, bars, fills, images, vlines,
-        hlines`` — each entry carrying only arrays + its ``label``.
-
-    Examples
-    --------
-    >>> ax0 = arrays_from_data('run_data.npz')[0]
-    >>> x, y = ax0['lines'][0]['x'], ax0['lines'][0]['y']
-    """
-    if isinstance(data, (str, Path)):
-        data = load_plot_data(data)
-    out = []
-    for ad in data.get('axes', []):
-        entry = {k: ad.get(k, '') for k in ('title', 'xlabel', 'ylabel')}
-        entry['lines'] = [{'x': l['x'], 'y': l['y'], 'label': l.get('label', '')}
-                          for l in ad.get('lines', [])]
-        entry['scatter'] = [{'x': s['x'], 'y': s['y'], 'label': s.get('label', '')}
-                            for s in ad.get('scatter', [])]
-        entry['errorbars'] = [{'x': e['x'], 'y': e['y'], 'xerr': e.get('xerr'),
-                               'yerr': e.get('yerr'), 'label': e.get('label', '')}
-                              for e in ad.get('errorbars', [])]
-        entry['bars'] = [{'x': b['x'], 'heights': b['heights'],
-                          'widths': b['widths'], 'label': b.get('label', '')}
-                         for b in ad.get('bars', [])]
-        entry['fills'] = [{'t': f['t'], 'lo': f['lo'], 'hi': f['hi'],
-                           'orient': f['orient'], 'label': f.get('label', '')}
-                          for f in ad.get('fills', [])]
-        entry['images'] = [{'data': im['data'], 'extent': im.get('extent')}
-                           for im in ad.get('images', [])]
-        entry['vlines'] = [{'x': v['x']} for v in ad.get('vlines', [])]
-        entry['hlines'] = [{'y': h['y']} for h in ad.get('hlines', [])]
-        out.append(entry)
-    return out
-
-
-def load_arrays(path: Union[str, Path]) -> list:
-    """Convenience: arrays_from_data(load_plot_data(path)).
-
-    Returns just the numeric arrays per axes (see arrays_from_data), leaving
-    the full style/layout metadata in load_plot_data() for those who want it.
-    """
-    return arrays_from_data(load_plot_data(path))
-
-
-def get_series(data: Union[dict, str, Path]) -> list:
-    """Flatten each axes into a uniform list of plottable series with x & y.
-
-    This is the easy way to reuse saved data: every item — line, scatter,
-    errorbar, bar, or fill band — comes back with the SAME ``x`` and ``y`` keys,
-    so you can loop and plot without knowing its type:
-
-        for s in mfs.get_series('run_data.npz')[0]:   # [0] = first axes
-            ax.plot(s['x'], s['y'], label=s['label'])
-
-    Parameters
-    ----------
-    data : dict | str | Path
-        An extract_plot_data() dict, or a path to a ``*_data.npz`` file.
-
-    Returns
-    -------
-    list[list[dict]]
-        One inner list per axes. Each series dict always has:
-          ``kind``   : 'line' | 'scatter' | 'errorbar' | 'bar' | 'fill'
-                       | 'vline' | 'hline'
-          ``label``  : the artist's label ('' if none)
-          ``x``, ``y`` : numpy arrays ready to plot (for a 'fill', ``y`` is the
-                       lower boundary). For 'vline' ``y`` is None; for 'hline'
-                       ``x`` is None.
-        Extra keys when relevant:
-          'fill'      → ``y_upper`` (upper boundary) and ``orient`` ('v'/'h'),
-                        so you can ``ax.fill_between(s['x'], s['y'], s['y_upper'])``
-          'errorbar'  → ``xerr``, ``yerr`` (or None)
-          'bar'       → ``widths``
-
-    Examples
-    --------
-    >>> series = mfs.get_series('run_data.npz')
-    >>> fig, ax = plt.subplots()
-    >>> for s in series[0]:
-    ...     if s['kind'] == 'fill':
-    ...         ax.fill_between(s['x'], s['y'], s['y_upper'], alpha=0.2,
-    ...                         label=s['label'])
-    ...     else:
-    ...         ax.plot(s['x'], s['y'], label=s['label'])
-    """
-    axes_arrays = arrays_from_data(data)
-    out = []
-    for ad in axes_arrays:
-        series = []
-        for l in ad['lines']:
-            series.append({'kind': 'line', 'label': l['label'],
-                           'x': l['x'], 'y': l['y']})
-        for s in ad['scatter']:
-            series.append({'kind': 'scatter', 'label': s['label'],
-                           'x': s['x'], 'y': s['y']})
-        for e in ad['errorbars']:
-            series.append({'kind': 'errorbar', 'label': e['label'],
-                           'x': e['x'], 'y': e['y'],
-                           'xerr': e.get('xerr'), 'yerr': e.get('yerr')})
-        for b in ad['bars']:
-            series.append({'kind': 'bar', 'label': b['label'],
-                           'x': b['x'], 'y': b['heights'],
-                           'widths': b['widths']})
-        for f in ad['fills']:
-            series.append({'kind': 'fill', 'label': f['label'],
-                           'x': f['t'], 'y': f['lo'], 'y_upper': f['hi'],
-                           'orient': f['orient']})
-        for v in ad['vlines']:
-            series.append({'kind': 'vline', 'label': '',
-                           'x': np.array([v['x']]), 'y': None})
-        for h in ad['hlines']:
-            series.append({'kind': 'hline', 'label': '',
-                           'x': None, 'y': np.array([h['y']])})
-        out.append(series)
-    return out
-
-
-def fix_vscode_widget_style():
-    """Make %matplotlib widget figures theme-correctly inside VS Code.
-
-    Injects CSS so the ipywidgets container is transparent (no hard-coded white
-    box in dark themes) and widget text/labels follow VS Code's editor colors.
-    No-op outside an IPython display context. Call once per notebook, e.g. right
-    after mfs.install().
-    """
-    try:
-        from IPython.display import display, HTML
-    except Exception:
-        return
-    display(HTML(
-        "<style>"
-        ".cell-output-ipywidget-background{background-color:transparent !important;}"
-        ".jp-OutputArea-output{background-color:transparent !important;}"
-        ":root{"
-        "--jp-widgets-color:var(--vscode-editor-foreground);"
-        "--jp-widgets-label-color:var(--vscode-editor-foreground);"
-        "--jp-widgets-font-size:var(--vscode-editor-font-size);"
-        "}"
-        ".lm-Widget,.jupyter-widgets{color:var(--vscode-editor-foreground);}"
-        "</style>"
-    ))
-
-
-# ============================================================================
-#  REPLOT FROM EXTRACTED DATA  (version-proof path — no pickle)
-# ============================================================================
-
-def replot_from_data(data: Union[dict, str, Path], *, show: bool = False):
-    """Rebuild a Figure from extracted ARRAYS (no pickle) — version-proof.
-
-    Reconstructs lines, scatter, errorbars, bars, images, axvline/axhline,
-    text, fill_between/fill_betweenx (incl. where= gaps), scales, labels,
-    limits, legend, label/tick colors, figure size, and twinx/twiny axes.
-    Regular subplot grids (e.g. 2x2) are rebuilt from stored geometry; an
-    irregular gridspec falls back to an N-row column. Does NOT reconstruct
-    pcolormesh/contour/stackplot — use loadfig() on the .mplpkl for a
-    pixel-faithful copy.
-
-    Parameters
-    ----------
-    data : dict | str | Path
-        An extract_plot_data() dict, or a path to a ``*_data.npz`` file.
+    path_or_tree : str | Path | dict
+        A ``.mplscene`` path, or a tree dict (then pass ``arrays`` too).
     show : bool, default False
-        If True, call fig.show() before returning.
 
     Returns
     -------
     matplotlib.figure.Figure
-        A freshly built figure. (For the raw arrays alone, see load_arrays.)
     """
     _ensure_mpl()
-    import matplotlib.dates as mdates
-
-    if isinstance(data, (str, Path)):
-        data = load_plot_data(data)
-
-    all_axes = data.get('axes', [])
-    # Primaries get a cell; twins attach to their primary.
-    primaries = [i for i, ad in enumerate(all_axes) if ad.get('twin_of') is None]
-    figsize = data.get('figsize') or None
-
-    # If every primary reports the same regular (nrows, ncols) grid with a
-    # single-cell span, rebuild that grid (so a 2x2 comes back as a 2x2).
-    # Otherwise fall back to an N-row column.
-    geoms = [all_axes[i].get('subplot_geom') for i in primaries]
-    axmap = {}                                   # data-index → live Axes
-    use_grid = (len(primaries) > 0 and all(g is not None for g in geoms)
-                and len({(g[0], g[1]) for g in geoms}) == 1
-                and all(g[2] == g[3] for g in geoms))
-    if use_grid:
-        nrows, ncols = geoms[0][0], geoms[0][1]
-        fig, axs2d = _plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-        flat = axs2d.ravel()
-        used = set()
-        for i, g in zip(primaries, geoms):
-            axmap[i] = flat[g[2]]
-            used.add(g[2])
-        for k, a in enumerate(flat):             # drop unused empty cells
-            if k not in used:
-                a.remove()
+    if arrays is None:
+        tree, arrays = _scene.load_scene(str(path_or_tree))
     else:
-        n = max(1, len(primaries))
-        fig, axs = _plt.subplots(n, 1, figsize=figsize, squeeze=False)
-        axs = axs.ravel()
-        for row, i in enumerate(primaries):
-            axmap[i] = axs[row]
-    for i, ad in enumerate(all_axes):            # create twins on their primary
-        if ad.get('twin_of') is not None:
-            base = axmap.get(ad['twin_of'])
-            if base is None:
-                continue
-            axmap[i] = base.twinx() if ad.get('twin_kind') == 'x' else base.twiny()
-
-    for i, ad in enumerate(all_axes):
-        ax = axmap.get(i)
-        if ax is not None:
-            _draw_axes(ax, ad, mdates)
-
-    if data.get('suptitle'):
-        fig.suptitle(data['suptitle'])
-    try:
-        fig.tight_layout()
-    except Exception:
-        pass
+        tree = path_or_tree
+    fig = _scene.replay_figure(tree, arrays)
     if show:
         fig.show()
     return fig
 
 
-def _draw_axes(ax, ad, mdates):
-    """Draw one extracted axes dict onto a live Axes (used by replot)."""
-    for ln in ad.get('lines', []):
-        x = mdates.num2date(ln['x']) if ad.get('x_is_date') else ln['x']
-        ax.plot(x, ln['y'], label=ln.get('label') or None,
-                color=ln.get('color'), linestyle=ln.get('linestyle', '-'),
-                linewidth=ln.get('linewidth'), marker=ln.get('marker', ''))
-    for sc in ad.get('scatter', []):
-        kw = {}
-        if 'sizes' in sc:
-            kw['s'] = sc['sizes']
-        if 'facecolors' in sc:
-            kw['c'] = sc['facecolors']
-        ax.scatter(sc['x'], sc['y'], label=sc.get('label') or None, **kw)
-    for eb in ad.get('errorbars', []):
-        yerr = eb.get('yerr'); xerr = eb.get('xerr')
-        ax.errorbar(eb['x'], eb['y'],
-                    yerr=yerr.T if yerr is not None else None,
-                    xerr=xerr.T if xerr is not None else None,
-                    fmt='o', label=eb.get('label') or None)
-    for b in ad.get('bars', []):
-        ax.bar(b['x'], b['heights'], width=b['widths'],
-               label=b.get('label') or None, align='edge')
-    for fb in ad.get('fills', []):
-        kw = {}
-        if fb.get('facecolor') is not None:
-            kw['color'] = fb['facecolor']        # RGBA carries alpha already
-        elif fb.get('alpha') is not None:
-            kw['alpha'] = fb['alpha']
-        if fb.get('label'):
-            kw['label'] = fb['label']
-        if fb.get('orient') == 'h':
-            ax.fill_betweenx(fb['t'], fb['lo'], fb['hi'], **kw)
-        else:
-            ax.fill_between(fb['t'], fb['lo'], fb['hi'], **kw)
-    for im in ad.get('images', []):
-        ax.imshow(im['data'], extent=im.get('extent'),
-                  cmap=im.get('cmap'), aspect=im.get('aspect', 'equal'))
-        if im.get('clim') is not None:
-            ax.images[-1].set_clim(im['clim'])
-    for vl in ad.get('vlines', []):
-        ax.axvline(vl['x'], color=vl.get('color'),
-                   linestyle=vl.get('linestyle', '-'), linewidth=vl.get('linewidth'))
-    for hl in ad.get('hlines', []):
-        ax.axhline(hl['y'], color=hl.get('color'),
-                   linestyle=hl.get('linestyle', '-'), linewidth=hl.get('linewidth'))
-    for t in ad.get('texts', []):
-        ax.text(t['xy'][0], t['xy'][1], t['text'], color=t.get('color'))
+def read_data(path):
+    """Queryable data view of a saved figure — the thing MATLAB .fig lacks.
 
-    if ad.get('xscale'):
-        ax.set_xscale(ad['xscale'])
-    if ad.get('yscale'):
-        ax.set_yscale(ad['yscale'])
-    ax.set_title(ad.get('title', ''))
-    ax.set_xlabel(ad.get('xlabel', ''), color=ad.get('xlabel_color') or 'black')
-    ax.set_ylabel(ad.get('ylabel', ''), color=ad.get('ylabel_color') or 'black')
-    if ad.get('xtick_color'):
-        ax.tick_params(axis='x', labelcolor=ad['xtick_color'])
-    if ad.get('ytick_color'):
-        ax.tick_params(axis='y', labelcolor=ad['ytick_color'])
-    try:
-        ax.set_xlim(ad['xlim']); ax.set_ylim(ad['ylim'])
-    except Exception:
-        pass
-    if ad.get('has_legend'):
-        handles, labels = ax.get_legend_handles_labels()
-        if labels:
-            ax.legend()
+    Parameters
+    ----------
+    path : str | Path
+        A ``.mplscene`` file.
+
+    Returns
+    -------
+    mpl_scene.FigureData
+        Index by label (``d["signal"]``), unpack to arrays (``x, y = d["signal"]``),
+        filter by kind (``d.of_kind("fill")``), export (``d.to_csv(...)``,
+        ``d.to_dataframe()``), or re-draw one series (``s.plot(ax)``).
+
+    Examples
+    --------
+    >>> d = mfs.read_data("run.mplscene")
+    >>> d.labels
+    ['signal', 'band']
+    >>> x, y = d["signal"]
+    >>> d["band"].hi[:3]
+    """
+    return _scene.read_data(str(path))
+
+
+def figure_data(fig):
+    """Same queryable view, straight from a live Figure (no file needed)."""
+    return _scene.figure_data(fig)
 
 
 # ============================================================================
@@ -816,7 +242,7 @@ def savefig_bundle(fig, path: Union[str, Path], *, compress: bool = True,
         'figure': fig,
         'matplotlib_version': _mpl.__version__,
         'numpy_version': np.__version__,
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
         'extra_data': extra_data or {},
     }
     try:
@@ -837,7 +263,7 @@ def loadfig(path: Union[str, Path], *, show: bool = False):
 
     The figure is re-bound to a fresh pyplot-managed canvas so plt.show() and
     interactive editing work. Preserves the ORIGINAL layout exactly (grids,
-    gridspec, twins, colors) — unlike replot_from_data(), which rebuilds from
+    gridspec, twins, colors) — unlike replot_scene(), which rebuilds from
     arrays. Warns if the loading matplotlib differs from the saving version.
 
     Parameters
@@ -880,7 +306,7 @@ def loadfig(path: Union[str, Path], *, show: bool = False):
         warnings.warn(
             f"mpl_figure_saver: .mplpkl was saved with matplotlib {saved_ver}, "
             f"loading with {_mpl.__version__}. If it looks wrong, replot from "
-            f"the .npz via replot_from_data().", stacklevel=2)
+            f"the .mplscene via replot_scene().", stacklevel=2)
 
     # Re-bind to a fresh pyplot-managed canvas so plt.show() finds it.
     # (Create the host figure, point its manager at our figure — do NOT close
@@ -927,9 +353,9 @@ def save_figure_folder(fig, filepath: Union[str, Path], *,
 
     if save_data:
         try:
-            saved.append(str(save_plot_data(fig, folder / f"{stem}_data")))
+            saved.append(str(save_scene_file(fig, folder / stem)))
         except Exception as e:
-            _loud(f"data extraction failed: {e}")
+            _loud(f"scene extraction failed: {e}")
     if save_pickle:
         p = savefig_bundle(fig, folder / stem)
         if p is not None:
@@ -1013,7 +439,7 @@ def _figure_name_hint(fig) -> str:
 def _timestamp_folder(fig) -> Path:
     """B: plot_<YYYYMMDD_HHMMSS_ffffff>[_suptitle], collision-checked."""
     base = _widget_save_dir
-    stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    stamp = datetime.now().isoformat(timespec='seconds')
     hint = _figure_name_hint(fig)
     stem = f"plot_{stamp}" + (f"_{hint}" if hint else '')
     candidate = base / stem
@@ -1038,9 +464,9 @@ def _write_extras(fig, folder: Path, stem: str, fmt: str, want_data, want_pickle
         _loud(f"image disk save failed: {e}")
     if want_data:
         try:
-            saved.append(str(save_plot_data(fig, folder / f"{stem}_data")))
+            saved.append(str(save_scene_file(fig, folder / stem)))
         except Exception as e:
-            _loud(f"data extraction failed: {e}")
+            _loud(f"scene extraction failed: {e}")
     if want_pickle:
         p = savefig_bundle(fig, folder / stem)
         if p is not None:
@@ -1135,7 +561,7 @@ def _dialog_choose_save(fig, default_fmt):
         v_pkl = tk.BooleanVar(value=want_pickle)
         # A tiny options window first, then the file dialog.
         opt = tk.Toplevel(root); opt.title("Save options")
-        tk.Checkbutton(opt, text="Also save plot data (.npz)", variable=v_data).pack(anchor='w', padx=10, pady=4)
+        tk.Checkbutton(opt, text="Also save plot data (.mplscene)", variable=v_data).pack(anchor='w', padx=10, pady=4)
         tk.Checkbutton(opt, text="Also save editable figure (.mplpkl)", variable=v_pkl).pack(anchor='w', padx=10, pady=4)
         proceed = {'ok': False}
         tk.Button(opt, text="Choose location…",
@@ -1145,11 +571,12 @@ def _dialog_choose_save(fig, default_fmt):
         if not proceed['ok']:
             root.destroy(); return None
         initial = (_widget_save_dir or Path.cwd())
+        all_fmts = ['pdf', 'svg', 'png', 'jpg', 'jpeg', 'tif', 'tiff']
         fname = filedialog.asksaveasfilename(
             initialdir=str(initial),
             initialfile=(_figure_name_hint(fig) or 'figure') + f".{default_fmt}",
             defaultextension=f".{default_fmt}",
-            filetypes=[("Image", f"*.{default_fmt}"), ("All files", "*.*")])
+            filetypes=[(f"{default_fmt.upper()}", f"*.{default_fmt}")] + list((f"{a.upper()}", f"*.{a}") for a in list(set(sorted(all_fmts))-set([default_fmt]))) + [("All files", "*.*")])
         root.destroy()
         if not fname:
             return None
@@ -1178,15 +605,15 @@ def _patched_savefig(self, fname, *args, **kwargs):
         return result
     try:
         p = Path(str(fname))
-        if p.suffix == '.mplpkl':
+        if p.suffix in ('.mplpkl', SCENE_EXT):
             return result
         if _prefs.get('save_pickle', True):
             savefig_bundle(self, p.with_suffix('.mplpkl'))
         if _prefs.get('save_data', True):
             try:
-                save_plot_data(self, p.with_suffix('.npz'))
+                save_scene_file(self, p.with_suffix(SCENE_EXT))
             except Exception as e:
-                _loud(f"auto .npz failed: {e}")
+                _loud(f"auto {SCENE_EXT} failed: {e}")
     except Exception as e:
         _loud(f"auto-bundle failed: {e}")
     return result
@@ -1385,7 +812,7 @@ def _make_patched_toolbar_save(OrigToolbarClass):
             container = QtWidgets.QWidget()
             hbox = QtWidgets.QHBoxLayout(container)
             hbox.setContentsMargins(0, 4, 0, 0)
-            cb_data = QtWidgets.QCheckBox("Also save plot data (.npz)")
+            cb_data = QtWidgets.QCheckBox("Also save plot data (.mplscene)")
             cb_data.setChecked(_prefs['save_data'])
             cb_pickle = QtWidgets.QCheckBox("Also save editable figure (.mplpkl)")
             cb_pickle.setChecked(_prefs['save_pickle'])
@@ -1440,7 +867,8 @@ class ExperimentResult:
         self.params = params or {}
         self.data: Dict[str, Any] = {}
         self.figures: Dict[str, Any] = {}
-        self.metadata: dict = {'created': datetime.now().isoformat(), 'notes': notes}
+        self.metadata: dict = {'created': datetime.now().isoformat(timespec='seconds'),
+                               'notes': notes}
 
     def store(self, key: str, value: Any): self.data[key] = value
     def __getitem__(self, key): return self.data[key]
@@ -1479,7 +907,7 @@ class ExperimentResult:
         if path.suffix not in ('.expr', '.mplpkl'):
             path = path.with_suffix('.expr')
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.metadata['saved'] = datetime.now().isoformat()
+        self.metadata['saved'] = datetime.now().isoformat(timespec='seconds')
         self.metadata['numpy_version'] = np.__version__
         try:
             _ensure_mpl(); self.metadata['matplotlib_version'] = _mpl.__version__
