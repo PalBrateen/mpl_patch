@@ -518,6 +518,80 @@ def load_arrays(path: Union[str, Path]) -> list:
     return arrays_from_data(load_plot_data(path))
 
 
+def get_series(data: Union[dict, str, Path]) -> list:
+    """Flatten each axes into a uniform list of plottable series with x & y.
+
+    This is the easy way to reuse saved data: every item — line, scatter,
+    errorbar, bar, or fill band — comes back with the SAME ``x`` and ``y`` keys,
+    so you can loop and plot without knowing its type:
+
+        for s in mfs.get_series('run_data.npz')[0]:   # [0] = first axes
+            ax.plot(s['x'], s['y'], label=s['label'])
+
+    Parameters
+    ----------
+    data : dict | str | Path
+        An extract_plot_data() dict, or a path to a ``*_data.npz`` file.
+
+    Returns
+    -------
+    list[list[dict]]
+        One inner list per axes. Each series dict always has:
+          ``kind``   : 'line' | 'scatter' | 'errorbar' | 'bar' | 'fill'
+                       | 'vline' | 'hline'
+          ``label``  : the artist's label ('' if none)
+          ``x``, ``y`` : numpy arrays ready to plot (for a 'fill', ``y`` is the
+                       lower boundary). For 'vline' ``y`` is None; for 'hline'
+                       ``x`` is None.
+        Extra keys when relevant:
+          'fill'      → ``y_upper`` (upper boundary) and ``orient`` ('v'/'h'),
+                        so you can ``ax.fill_between(s['x'], s['y'], s['y_upper'])``
+          'errorbar'  → ``xerr``, ``yerr`` (or None)
+          'bar'       → ``widths``
+
+    Examples
+    --------
+    >>> series = mfs.get_series('run_data.npz')
+    >>> fig, ax = plt.subplots()
+    >>> for s in series[0]:
+    ...     if s['kind'] == 'fill':
+    ...         ax.fill_between(s['x'], s['y'], s['y_upper'], alpha=0.2,
+    ...                         label=s['label'])
+    ...     else:
+    ...         ax.plot(s['x'], s['y'], label=s['label'])
+    """
+    axes_arrays = arrays_from_data(data)
+    out = []
+    for ad in axes_arrays:
+        series = []
+        for l in ad['lines']:
+            series.append({'kind': 'line', 'label': l['label'],
+                           'x': l['x'], 'y': l['y']})
+        for s in ad['scatter']:
+            series.append({'kind': 'scatter', 'label': s['label'],
+                           'x': s['x'], 'y': s['y']})
+        for e in ad['errorbars']:
+            series.append({'kind': 'errorbar', 'label': e['label'],
+                           'x': e['x'], 'y': e['y'],
+                           'xerr': e.get('xerr'), 'yerr': e.get('yerr')})
+        for b in ad['bars']:
+            series.append({'kind': 'bar', 'label': b['label'],
+                           'x': b['x'], 'y': b['heights'],
+                           'widths': b['widths']})
+        for f in ad['fills']:
+            series.append({'kind': 'fill', 'label': f['label'],
+                           'x': f['t'], 'y': f['lo'], 'y_upper': f['hi'],
+                           'orient': f['orient']})
+        for v in ad['vlines']:
+            series.append({'kind': 'vline', 'label': '',
+                           'x': np.array([v['x']]), 'y': None})
+        for h in ad['hlines']:
+            series.append({'kind': 'hline', 'label': '',
+                           'x': None, 'y': np.array([h['y']])})
+        out.append(series)
+    return out
+
+
 def fix_vscode_widget_style():
     """Make %matplotlib widget figures theme-correctly inside VS Code.
 
@@ -992,17 +1066,18 @@ def _make_patched_widget_toolbar_save():
             choice = _dialog_choose_save(fig, rcParams.get('savefig.format', 'png'))
             if choice is None:
                 return  # cancelled → no browser download, no files
-            folder, stem, fmt, want_data, want_pickle = choice
-            saved = []
+            fname, want_data, want_pickle = choice   # fname is the user's path
             if want_data or want_pickle:
-                _, saved = save_figure_folder(
-                    fig, folder / f"{stem}.{fmt}",
-                    save_data=want_data, save_pickle=want_pickle)
+                # save_figure_folder nests <parent>/<stem>/ exactly once,
+                # the same as the Qt path — pass the raw chosen path straight in.
+                folder, saved = save_figure_folder(
+                    fig, fname, save_data=want_data, save_pickle=want_pickle)
+                _report_saved(folder, saved)
             else:
-                folder.mkdir(parents=True, exist_ok=True)
-                (_original_savefig or _Figure.savefig)(fig, str(folder / f"{stem}.{fmt}"))
-                saved = [str(folder / f"{stem}.{fmt}")]
-            _report_saved(folder, saved)
+                p = Path(fname)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                (_original_savefig or _Figure.savefig)(fig, str(p))
+                _report_saved(p.parent, [str(p)])
             return
 
         # ---- mode B: timestamp folder (SSH / headless) ----
@@ -1038,16 +1113,20 @@ def _report_saved(folder, saved):
 # ---- Local save dialog for widget mode A (Qt if present, else tkinter) ----
 
 def _dialog_choose_save(fig, default_fmt):
-    """Return (folder, stem, fmt, want_data, want_pickle) or None if cancelled.
+    """Ask the user (via a local tkinter dialog) where to save and what extras.
 
-    Tries a Qt dialog (if a Qt binding is importable), then tkinter. Both run
-    on the kernel's machine, so this only makes sense when the kernel has a
-    display (local or remote-desktop). On SSH use mode 'timestamp'.
+    Returns ``(chosen_path, want_data, want_pickle)`` or ``None`` if cancelled.
+    ``chosen_path`` is passed as-is to save_figure_folder(), which creates the
+    single ``<parent>/<stem>/`` folder — so don't pre-nest here.
+
+    Runs on the kernel's machine, so it only makes sense when the kernel has a
+    display (local or remote-desktop). On a bare SSH session use the
+    'timestamp' widget mode instead. tkinter ships with CPython; if it can't
+    open (no display), this warns and returns None.
     """
     want_data = _prefs.get('save_data', True)
     want_pickle = _prefs.get('save_pickle', True)
 
-    # tkinter path (most portable; ships with CPython)
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -1077,8 +1156,9 @@ def _dialog_choose_save(fig, default_fmt):
         _prefs['save_data'] = v_data.get()
         _prefs['save_pickle'] = v_pkl.get()
         p = Path(fname)
-        fmt = p.suffix.lstrip('.') or default_fmt
-        return p.parent / p.stem, p.stem, fmt, v_data.get(), v_pkl.get()
+        if not p.suffix:
+            p = p.with_suffix(f".{default_fmt}")
+        return p, v_data.get(), v_pkl.get()
     except Exception as e:
         _loud(f"dialog mode unavailable ({type(e).__name__}: {e}); no display? "
               f"Use widget_mode='timestamp' on headless/SSH sessions.")

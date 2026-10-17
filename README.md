@@ -41,7 +41,8 @@ fig.savefig("figs/sine.png")          # also writes sine.mplpkl + sine_data.npz
 
 fig2, extra = mfs.loadfig("figs/sine.mplpkl")   # exact, editable figure
 fig3 = mfs.replot_from_data("figs/sine_data.npz")  # version-proof rebuild
-x, y = mfs.load_arrays("figs/sine_data.npz")[0]["lines"][0].values()  # raw arrays
+for s in mfs.get_series("figs/sine_data.npz")[0]:      # uniform x/y per item
+    plt.plot(s["x"], s["y"], label=s["label"])
 ```
 
 See **`demo_mpl_figure_saver.ipynb`** (or run `python demo_mpl_figure_saver.py`)
