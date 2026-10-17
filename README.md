@@ -85,15 +85,31 @@ same matplotlib version, use `loadfig()` on the `.mplpkl`.
 
 `read_data()` returns a queryable view — the part MATLAB's `.fig` has no API for:
 
+It behaves like a **dict of series**, so the idioms are the ones you already use:
+
 ```python
 d = mfs.read_data("run.mplscene")
-d.labels                      # ['signal', 'band', 'pts']
-x, y = d["signal"]            # index by label, unpacks to arrays
-d["band"].hi                  # kind-specific extras (lo/hi, xerr/yerr, sizes)
-d.of_kind("fill")             # filter
-d.to_csv("run.csv"); d.to_dataframe()
-d["signal"].plot(ax)          # re-draw one series anywhere
+
+d.keys()                          # ['signal', 'band', 'pts']
+'signal' in d                     # True
+for label, s in d.items():
+    print(label, len(s))
+
+s = d["signal"]                   # one series
+x, y = s.x, s.y                   # plain numpy arrays
+x, y = s                          # or unpack, if you prefer
+plt.plot(x, y)                    # ordinary matplotlib from here on
+
+s["x"], s.keys()                  # dict-style too
+d.to_dict()                       # {label: {'x': array, 'y': array}}
+d.to_csv("run.csv")               # or d.to_dataframe() if pandas installed
+
+[s for s in d if s.kind == "fill"]        # filter with a comprehension
+band = d["band"]; band.lo, band.hi        # extras only where they exist
 ```
+
+Nothing forces you to learn a new plotting vocabulary — pull out `x` and `y`
+and use matplotlib exactly as you normally would.
 
 ## `ExperimentResult`
 

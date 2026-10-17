@@ -15,6 +15,7 @@ from matplotlib.image import AxesImage
 from matplotlib.spines import Spine
 import matplotlib.ticker as mticker
 import matplotlib.colors as mcolors
+import matplotlib.dates as mdates
 
 SCHEMA = 1
 
@@ -67,6 +68,18 @@ def _tf_tag(tr, ax, fig):
         if tr is ax.transAxes: return "axes"
         if tr is ax.get_xaxis_transform(): return "xaxis"
         if tr is ax.get_yaxis_transform(): return "yaxis"
+        # axhspan/axvspan wrap a blended transform in a composite, so identity
+        # fails. Compare what the transforms actually DO on probe points.
+        try:
+            probe = np.array([[0.0, 0.0], [1.0, 1.0], [0.3, 0.7]])
+            got = tr.transform(probe)
+            for tag, cand in (("xaxis", ax.get_xaxis_transform()),
+                              ("yaxis", ax.get_yaxis_transform()),
+                              ("axes", ax.transAxes), ("data", ax.transData)):
+                if np.allclose(got, cand.transform(probe), rtol=1e-9, atol=1e-9):
+                    return tag
+        except Exception:
+            pass
     if fig is not None and tr is fig.transFigure: return "figure"
     return None
 
@@ -122,6 +135,10 @@ def _enc_locator(loc):
         return {"cls": t, "nbins": getattr(loc, "_nbins", "auto")}
     if isinstance(loc, mticker.LogLocator):
         return {"cls": t, "base": float(getattr(loc, "_base", 10))}
+    if isinstance(loc, mdates.AutoDateLocator): return {"cls": "AutoDateLocator"}
+    if isinstance(loc, mdates.DayLocator): return {"cls": "DayLocator"}
+    if isinstance(loc, mdates.MonthLocator): return {"cls": "MonthLocator"}
+    if isinstance(loc, mdates.YearLocator): return {"cls": "YearLocator"}
     if isinstance(loc, (mticker.AutoLocator, mticker.AutoMinorLocator,
                         mticker.NullLocator, mticker.IndexLocator)):
         return {"cls": t}
@@ -136,11 +153,18 @@ def _dec_locator(spec):
         if cls == "LogLocator": return mticker.LogLocator(base=spec.get("base", 10))
         if cls == "NullLocator": return mticker.NullLocator()
         if cls == "AutoMinorLocator": return mticker.AutoMinorLocator()
+        if cls == "AutoDateLocator": return mdates.AutoDateLocator()
+        if cls == "DayLocator": return mdates.DayLocator()
+        if cls == "MonthLocator": return mdates.MonthLocator()
+        if cls == "YearLocator": return mdates.YearLocator()
     except Exception: pass
     return mticker.AutoLocator()
 
 def _enc_formatter(fm):
     t = type(fm).__name__
+    if isinstance(fm, mdates.ConciseDateFormatter): return {"cls": "ConciseDateFormatter"}
+    if isinstance(fm, mdates.AutoDateFormatter): return {"cls": "AutoDateFormatter"}
+    if isinstance(fm, mdates.DateFormatter): return {"cls": "DateFormatter", "fmt": fm.fmt}
     if isinstance(fm, mticker.FixedFormatter):
         return {"cls": t, "seq": list(fm.seq)}
     if isinstance(fm, mticker.StrMethodFormatter):
@@ -160,6 +184,11 @@ def _dec_formatter(spec):
         if cls == "StrMethodFormatter": return mticker.StrMethodFormatter(spec["fmt"])
         if cls == "FormatStrFormatter": return mticker.FormatStrFormatter(spec["fmt"])
         if cls == "NullFormatter": return mticker.NullFormatter()
+        if cls == "DateFormatter": return mdates.DateFormatter(spec["fmt"])
+        if cls in ("AutoDateFormatter", "ConciseDateFormatter"):
+            loc = mdates.AutoDateLocator()
+            return (mdates.ConciseDateFormatter(loc) if cls.startswith("Concise")
+                    else mdates.AutoDateFormatter(loc))
         f = getattr(mticker, cls, None)
         if f is not None: return f()
     except Exception: pass
@@ -190,6 +219,15 @@ def _base_of(art):
     return "artist"
 
 
+def _numeric(vals):
+    """Coerce plot data to float, converting datetimes via date2num."""
+    a = np.asarray(vals)
+    if a.dtype.kind in "Mm" or (a.dtype == object and a.size
+                                and hasattr(a.flat[0], "toordinal")):
+        return np.asarray(mdates.date2num(a), dtype=np.float64)
+    return np.asarray(a, dtype=np.float64)
+
+
 def _errs(cont, arrays):
     """Per-axis error magnitudes from an ErrorbarContainer -> {'x':..,'y':..}."""
     out = {}
@@ -218,12 +256,14 @@ def _dump_artist(art, ax, fig, arrays, report):
     node = {"cls": type(art).__name__, "base": _base_of(art),
             "props": _props_of(art, arrays, report),
             "label": art.get_label()}
-    tr = _tf_tag(art.get_transform(), ax, fig)
+    _tr = (art.get_data_transform() if isinstance(art, Patch)
+           else art.get_transform())
+    tr = _tf_tag(_tr, ax, fig)
     if tr: node["tf"] = tr
     # class-specific payload the generic props skip
     if isinstance(art, Line2D):
-        node["data"] = [arrays.put(np.asarray(art.get_xdata(), float)),
-                        arrays.put(np.asarray(art.get_ydata(), float))]
+        node["data"] = [arrays.put(_numeric(art.get_xdata())),
+                        arrays.put(_numeric(art.get_ydata()))]
     elif isinstance(art, QuadMesh):
         try:
             node["coords"] = arrays.put(np.asarray(art.get_coordinates(), float))
@@ -241,6 +281,11 @@ def _dump_artist(art, ax, fig, arrays, report):
         node["clim"] = [float(c) for c in art.get_clim()]
     elif isinstance(art, Collection):
         node["paths"] = [_enc(p, arrays, report) for p in art.get_paths()]
+        try:                                  # no fill at all => stroke-only
+            fc_ = np.asarray(art.get_facecolor())
+            node["line_like"] = bool(fc_.size == 0 or np.all(fc_[:, -1] == 0))
+        except Exception:
+            node["line_like"] = False
         off = art.get_offsets()
         if off is not None and len(np.asarray(off)): 
             node["offsets"] = arrays.put(np.asarray(off, float))
@@ -309,10 +354,18 @@ def _make_artist(node, ax, arrays, report):
             sc = ax.scatter(off[:, 0], off[:, 1], s=sz,
                             c=(fc if fc is not None and len(np.asarray(fc)) else None))
             return ("attached", sc)
-        if cls == "LineCollection" or (base == "collection" and node.get("is_segments")):
+        if base == "collection" and node.get("line_like"):
+            # Stroke-only (contour lines, LineCollection): keep the Path objects
+            # so multi-part geometry is exact, and draw with no fill.
             paths = [_dec(p, arrays) for p in node.get("paths", [])]
-            segs = [p.vertices for p in paths]
-            return LineCollection(segs)
+            lc = PathCollection(list(paths))
+            lc.set_facecolor("none")
+            ec = _dec(node.get("ec"), arrays)
+            if ec is not None and len(np.asarray(ec)): lc.set_edgecolor(ec)
+            lw = _dec(node.get("lw"), arrays)
+            if lw is not None and len(np.atleast_1d(lw)): lc.set_linewidth(lw)
+            lc._mfs_done = True
+            return lc
         if base == "collection":                     # filled areas, contours, ...
             paths = [_dec(p, arrays) for p in node.get("paths", [])]
             # PathCollection keeps Path codes, so holes in filled contours and
@@ -350,6 +403,8 @@ def _make_artist(node, ax, arrays, report):
 
 def _apply_payload(art, node, arrays, report):
     """Apply the class-specific payload that generic props deliberately skip."""
+    if getattr(art, "_mfs_done", False):
+        return                      # stroke-only collection already styled
     rep = getattr(art, "_mfs_rep", None)
     for key, meth in (("fc", "set_facecolor"), ("ec", "set_edgecolor"),
                       ("lw", "set_linewidth"), ("sizes", "set_sizes")):
@@ -394,6 +449,12 @@ def _dump_axis(ax, which):
         "minor_loc": _enc_locator(axis.get_minor_locator()),
         "minor_fmt": _enc_formatter(axis.get_minor_formatter()),
     }
+    try:
+        conv = axis.get_converter() if hasattr(axis, "get_converter") else None
+        d["is_date"] = bool(conv is not None and isinstance(
+            conv, (mdates.DateConverter, getattr(mdates, "_SwitchableDateConverter", ()))))
+    except Exception:
+        d["is_date"] = False
     try: d["tick_params"] = {k: v for k, v in axis.get_tick_params().items()
                              if isinstance(v, (bool, int, float, str))
                              and k not in ("labelcolor", "color")}
@@ -409,6 +470,9 @@ def _apply_axis(ax, which, d, report):
     try:
         (ax.set_xscale if which == "x" else ax.set_yscale)(d["scale"])
     except Exception as e: report.append(f"{which}scale: {e}")
+    if d.get("is_date"):
+        try: axis.axis_date()
+        except Exception: pass
     axis.set_major_locator(_dec_locator(d["major_loc"]))
     axis.set_major_formatter(_dec_formatter(d["major_fmt"]))
     axis.set_minor_locator(_dec_locator(d["minor_loc"]))
@@ -442,6 +506,19 @@ def dump_figure(fig):
                        "facecolor": mcolors.to_hex(fig.get_facecolor(), keep_alpha=True),
                        "suptitle": fig._suptitle.get_text() if fig._suptitle else ""},
             "axes": []}
+    cbar_of = {}
+    for i, ax in enumerate(axes):
+        info = getattr(ax, "_colorbar_info", None)
+        if info is not None or hasattr(ax, "_colorbar"):
+            cb = getattr(ax, "_colorbar", None)
+            try:
+                mp_ax = cb.mappable.axes
+                cbar_of[i] = {"parent": idx.get(id(mp_ax)),
+                              "label": cb.ax.get_ylabel() or cb.ax.get_xlabel(),
+                              "orientation": getattr(cb, "orientation", "vertical")}
+            except Exception:
+                cbar_of[i] = {"parent": None, "label": "", "orientation": "vertical"}
+    tree["colorbars"] = cbar_of
     for i, ax in enumerate(axes):
         node = {"i": i,
                 "pos": [float(v) for v in ax.get_position().bounds],
@@ -542,6 +619,11 @@ def _scrub(o):
 class _Dummy:
     def get_siblings(self, a): return [a]
 
+def _proj(node):
+    p = node.get("projection")
+    return None if p in (None, "rectilinear") else p
+
+
 def _replay_container(ax, cd, arrays, report):
     """Rebuild an ErrorbarContainer / BarContainer with its native call."""
     cls = cd.get("cls")
@@ -591,9 +673,9 @@ def replay_figure(tree, arrays):
             key = (g[0], g[1])
             gs = gs_cache.get(key) or mgs.GridSpec(g[0], g[1], figure=fig)
             gs_cache[key] = gs
-            ax = fig.add_subplot(gs[g[2]:g[3]+1])
+            ax = fig.add_subplot(gs[g[2]:g[3]+1], projection=_proj(n))
         else:
-            ax = fig.add_axes(n["pos"])
+            ax = fig.add_axes(n["pos"], projection=_proj(n))
         made[n["i"]] = ax
     for n in nodes:
         if not is_twin(n): continue
@@ -606,6 +688,8 @@ def replay_figure(tree, arrays):
     for n in nodes:
         ax = made.get(n["i"])
         if ax is None: continue
+        try: ax.set_position(n["pos"])      # exact saved layout
+        except Exception: pass
         ax.set_facecolor(n["facecolor"]); ax.set_title(n["title"])
         try: ax.set_aspect(n["aspect"])
         except Exception: pass
@@ -648,6 +732,22 @@ def replay_figure(tree, arrays):
                 except Exception:
                     ax.legend(title=n["legend"]["title"] or None,
                               frameon=n["legend"]["frameon"])
+    # Colorbars: the cbar axes was created at its saved position like any other
+    # axes, so attach with cax= — using ax= would shrink the parent a 2nd time.
+    for ci, info in (tree.get("colorbars") or {}).items():
+        try:
+            cax = made.get(int(ci))
+            parent = made.get(int(info.get("parent")))
+            if cax is None or parent is None: continue
+            mappable = (list(parent.images) or list(parent.collections) or [None])[0]
+            if mappable is None: continue
+            cax.clear()
+            cb = fig.colorbar(mappable, cax=cax,
+                              orientation=info.get("orientation", "vertical"))
+            if info.get("label"): cb.set_label(info["label"])
+        except Exception as e:
+            report.append(f"colorbar: {type(e).__name__}: {e}")
+
     # final pass: restore autoscale MODE after every limit has been set
     for n in nodes:
         ax = made.get(n["i"])
@@ -711,6 +811,23 @@ class Series:
 
     def __len__(self):
         return 0 if self.x is None else len(np.atleast_1d(self.x))
+
+    def keys(self):
+        """Column names, like a dict / DataFrame."""
+        return list(self.columns().keys())
+
+    def __getitem__(self, k):
+        """series['x'] / series['y'] — dict-style access."""
+        c = self.columns()
+        if k in c: return c[k]
+        if k in self.extra: return self.extra[k]
+        raise KeyError(k)
+
+    def __contains__(self, k): return k in self.columns() or k in self.extra
+
+    def to_dict(self):
+        """Plain {name: array} dict — the least surprising export."""
+        return dict(self.columns())
 
     def columns(self):
         """Named 1-D columns for CSV/DataFrame export."""
@@ -776,6 +893,23 @@ class _Group(list):
     @property
     def labels(self): return [s.label for s in self if s.label]
 
+    def keys(self):
+        """Labels, like dict.keys()."""
+        return self.labels
+
+    def values(self): return list(self)
+
+    def items(self):
+        """(label, series) pairs, like dict.items()."""
+        return [(s.label or f"{s.kind}{i}", s) for i, s in enumerate(self)]
+
+    def get(self, label, default=None):
+        try: return self[label]
+        except KeyError: return default
+
+    def __contains__(self, k):
+        return any(s.label == k for s in self) if isinstance(k, str) else list.__contains__(self, k)
+
     def of_kind(self, kind): return _Group(s for s in self if s.kind == kind)
 
     def to_dataframe(self):
@@ -832,14 +966,25 @@ class FigureData:
         self.all = _Group(s for g in axes_groups for s in g)
         self.meta = meta or {}
 
+    # --- dict protocol: behaves like {label: series} ---
     def __getitem__(self, k): return self.all[k]
     def __iter__(self): return iter(self.all)
     def __len__(self): return len(self.all)
+    def __contains__(self, k): return k in self.all
+    def keys(self): return self.all.keys()
+    def values(self): return self.all.values()
+    def items(self): return self.all.items()
+    def get(self, k, default=None): return self.all.get(k, default)
+
     @property
     def labels(self): return self.all.labels
     def of_kind(self, kind): return self.all.of_kind(kind)
     def to_dataframe(self): return self.all.to_dataframe()
     def to_csv(self, path): return self.all.to_csv(path)
+
+    def to_dict(self):
+        """{label: {column: array}} — plain nested dict, no custom classes."""
+        return {lbl: s.to_dict() for lbl, s in self.items()}
 
     def replot(self, **kw):
         """Quick figure with every series re-drawn on its original axes index."""
