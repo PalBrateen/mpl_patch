@@ -104,6 +104,44 @@ def _loud(msg: str):
         pass
     warnings.warn(f"mpl_figure_saver: {msg}", stacklevel=2)
 
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+linestyles = [
+     ('solid', 'solid'),      # Same as (0, ()) or '-'
+     ('dotted', 'dotted'),    # Same as ':'
+     ('dashed', 'dashed'),    # Same as '--'
+     ('dashdot', 'dashdot'),  # Same as '-.'
+    #  ('loosely dotted',        (0, (1, 10))),
+    #  ('dotted',                (0, (1, 5))),
+     ('densely dotted',        (0, (1, 1))),
+
+    #  ('long dash with offset', (5, (10, 3))),
+    #  ('loosely dashed',        (0, (5, 10))),
+    #  ('dashed',                (0, (5, 5))),
+     ('densely dashed',        (0, (5, 1))),
+
+    #  ('loosely dashdotted',    (0, (3, 10, 1, 10))),
+     ('dashdotted',            (0, (3, 5, 1, 5))),
+     ('densely dashdotted',    (0, (3, 1, 1, 1))),
+
+    #  ('dashdotdotted',         (0, (3, 5, 1, 5, 1, 5))),
+    #  ('loosely dashdotdotted', (0, (3, 10, 1, 10, 1, 10))),
+    #  ('densely dashdotdotted', (0, (3, 1, 1, 1, 1, 1)))
+    ]
+
+def rgb2hex(r, g, b):
+    r, g, b = [max(0, min(x, 255)) for x in (r, g, b)]      # Ensure clamp 0 to 255
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def vscode_tweak():
+    from IPython.display import display, HTML
+    # 1. Force the widget container to be transparent via CSS injection
+    # This targets the specific 'lm-Widget' and 'jupyter-widgets' classes
+    # /* Remove the hardcoded white background from the interactive widget container */
+    # /* Ensure widget text and labels match VS Code foreground colors */
+    display(HTML("<style>.cell-output-ipywidget-background {background-color: transparent !important;}"\
+    ":root {--jp-widgets-color: var(--vscode-editor-foreground);"
+    "--jp-widgets-font-size: var(--vscode-editor-font-size);}</style>"))
+
 
 # ============================================================================
 #  DATA / SCENE  (delegates to mpl_scene: generic artist walk, no pickle)
