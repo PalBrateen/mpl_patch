@@ -111,6 +111,55 @@ band = d["band"]; band.lo, band.hi        # extras only where they exist
 Nothing forces you to learn a new plotting vocabulary — pull out `x` and `y`
 and use matplotlib exactly as you normally would.
 
+## Settings
+
+One validated object, in the spirit of `matplotlib.rcParams`:
+
+```python
+mfs.settings.save_pickle = False        # stop writing the .mplpkl
+mfs.settings.save_data = True           # keep writing the .mplscene
+
+with mfs.settings(save_data=False):     # or switch off for one block only
+    fig.savefig("quick.png")
+
+mfs.settings                            # print everything
+mfs.settings.reset()
+```
+
+Typos fail loudly instead of doing nothing (`mfs.settings.save_picke = False`
+raises and suggests `save_pickle`), and `"False"` is rejected rather than being
+treated as true. `install(...)` and `configure(...)` accept the same options and
+forward to this object.
+
+## Resizing and font sizes
+
+matplotlib keeps `figsize` (inches) and all sizes (points) independent. That is
+right for publication work, where 8 pt text must stay 8 pt, so **nothing is
+scaled automatically**. When you do want everything to scale together, it is
+explicit:
+
+```python
+# reopen a saved figure at another size, keeping its proportions
+fig = mfs.replot_scene("run.mplscene", figsize=(12, 8))            # scale="auto"
+fig = mfs.replot_scene("run.mplscene", figsize=(12, 8), scale=False)  # size only
+
+# or on any live figure
+mfs.resize_figure(fig, (12, 8))     # set size and scale contents together
+mfs.scale_figure(fig, 1.5)          # explicit factor
+mfs.scale_figure(fig)               # fit sizes to the figure's current size
+```
+
+`"auto"` scales by `min(new_w/old_w, new_h/old_h)`, so a figure that only gets
+wider does not overflow. Scaling covers fonts, line widths, marker sizes,
+tick length/width/pad, spines, grid, legend handles and arrow heads.
+`scale_figure(fig)` with no factor is relative to matplotlib's 6.4x4.8 design
+size and is idempotent; the applied scale is stored in the `.mplscene`, so
+reopening and calling it again does not scale twice.
+
+Font sizes, weights and families of titles (all three positions), axis labels,
+the legend and the suptitle are stored explicitly, so a figure reopens with the
+same text sizes even if your current `rcParams` are different.
+
 ## `ExperimentResult`
 
 Bundle raw data, parameters and figures into one `.expr` file for archiving:

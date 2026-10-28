@@ -34,6 +34,11 @@ Quick start
         save_data=True, save_pickle=True,
     )
 
+    # Switch things on/off later (validated; typos raise):
+    mfs.settings.save_pickle = False
+    with mfs.settings(save_data=False):    # ...or for one block only
+        fig.savefig('quick.png')
+
 Environment defaults (per machine, so one notebook runs everywhere):
     MPL_FIG_SAVER_DIR   → default save_dir
     MPL_FIG_SAVER_MODE  → default widget_mode ('timestamp' | 'dialog')
@@ -179,7 +184,8 @@ def load_scene_file(path):
     return _scene.load_scene(str(path))
 
 
-def replot_scene(path_or_tree, arrays=None, *, show=False):
+def replot_scene(path_or_tree, arrays=None, *, figsize=None, scale="auto",
+                 show=False):
     """Rebuild a Figure from a ``.mplscene`` file (version-proof path).
 
     Unlike loadfig() this uses no pickle: the figure is reconstructed by
@@ -190,6 +196,14 @@ def replot_scene(path_or_tree, arrays=None, *, show=False):
     ----------
     path_or_tree : str | Path | dict
         A ``.mplscene`` path, or a tree dict (then pass ``arrays`` too).
+    figsize : (float, float) | None
+        Reopen at a different size in inches. ``None`` (default) restores the
+        saved size exactly, with no scaling of anything.
+    scale : "auto" | float | False
+        Only used with ``figsize``. ``"auto"`` scales fonts, line widths,
+        markers and ticks by ``min(new_w/saved_w, new_h/saved_h)`` so the
+        figure keeps its proportions; a number forces that factor; ``False``
+        changes the size only.
     show : bool, default False
 
     Returns
@@ -201,7 +215,7 @@ def replot_scene(path_or_tree, arrays=None, *, show=False):
         tree, arrays = _scene.load_scene(str(path_or_tree))
     else:
         tree = path_or_tree
-    fig = _scene.replay_figure(tree, arrays)
+    fig = _scene.replay_figure(tree, arrays, figsize=figsize, scale=scale)
     if show:
         fig.show()
     return fig
@@ -231,6 +245,10 @@ def read_data(path):
     >>> d["band"].hi[:3]
     """
     return _scene.read_data(str(path))
+
+
+scale_figure = _scene.scale_figure
+resize_figure = _scene.resize_figure
 
 
 def figure_data(fig):
@@ -410,42 +428,156 @@ _original_toolbar_save = None
 _original_widget_save = None
 _installed = False
 
-_prefs = {'save_data': True, 'save_pickle': True}
+# ============================================================================
+#  SETTINGS  (one validated object — the single source of truth)
+# ============================================================================
 
-_widget_save_dir: Optional[Path] = None
-_widget_mode: str = 'timestamp'          # 'timestamp' (B) | 'dialog' (A)
-_widget_browser_download: Optional[bool] = None   # None → auto per mode
+class _Restore:
+    """Returned by settings(...): lets the same call double as a context manager.
+
+    The change is applied immediately (so a bare ``settings(save_pickle=False)``
+    works as a permanent switch); used in a ``with`` block it is undone on exit.
+    """
+    def __init__(self, owner, snapshot):
+        self._owner, self._snapshot = owner, snapshot
+
+    def __enter__(self):
+        return self._owner
+
+    def __exit__(self, *exc):
+        self._owner._v.update(self._snapshot)
+        return False
+
+
+class _Settings:
+    """Validated runtime settings, in the spirit of matplotlib's ``rcParams``.
+
+    Attributes
+    ----------
+    save_pickle : bool, default True
+        Also write the quick-reopen ``.mplpkl`` with every save.
+    save_data : bool, default True
+        Also write the pickle-free ``.mplscene`` with every save.
+    widget_mode : {'timestamp', 'dialog'}, default 'timestamp'
+        Behaviour of the ipympl toolbar Save button (see ``install``).
+    save_dir : Path | None, default None
+        Directory for widget 'timestamp'-mode saves. Assigning a path resolves
+        it to an absolute path immediately and creates it if missing.
+    widget_browser_download : bool | None, default None
+        Force the browser download on/off; None means automatic per mode.
+
+    Examples
+    --------
+    >>> mfs.settings.save_pickle = False          # switch off, permanently
+    >>> with mfs.settings(save_data=False):       # ...or just for a block
+    ...     fig.savefig("quick.png")
+    >>> mfs.settings                              # inspect everything
+    """
+    _DEFAULTS = {'save_pickle': True, 'save_data': True,
+                 'widget_mode': 'timestamp', 'save_dir': None,
+                 'widget_browser_download': None}
+    __slots__ = ('_v',)
+
+    def __init__(self):
+        object.__setattr__(self, '_v', dict(self._DEFAULTS))
+
+    # ---- validation -------------------------------------------------------
+    @staticmethod
+    def _bool(name, val):
+        if not isinstance(val, bool):          # "False" would be truthy!
+            raise TypeError(f"settings.{name} must be True or False, "
+                            f"got {val!r} ({type(val).__name__})")
+        return val
+
+    def _validate(self, name, val):
+        if name in ('save_pickle', 'save_data'):
+            return self._bool(name, val)
+        if name == 'widget_mode':
+            if val not in ('timestamp', 'dialog'):
+                raise ValueError("settings.widget_mode must be 'timestamp' "
+                                 f"or 'dialog', got {val!r}")
+            return val
+        if name == 'widget_browser_download':
+            return None if val is None else self._bool(name, val)
+        if name == 'save_dir':
+            if val is None:
+                return None
+            p = Path(val).expanduser().resolve()   # absolute NOW, not at save time
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        raise AttributeError(name)
+
+    # ---- attribute protocol ----------------------------------------------
+    def __getattr__(self, name):
+        v = object.__getattribute__(self, '_v')
+        if name in v:
+            return v[name]
+        raise AttributeError(self._unknown(name))
+
+    def __setattr__(self, name, val):
+        if name not in self._DEFAULTS:
+            raise AttributeError(self._unknown(name))
+        self._v[name] = self._validate(name, val)
+
+    def _unknown(self, name):
+        import difflib
+        near = difflib.get_close_matches(name, self._DEFAULTS, n=1)
+        hint = f" Did you mean {near[0]!r}?" if near else ""
+        return (f"mpl_figure_saver.settings has no setting {name!r}.{hint} "
+                f"Available: {', '.join(self._DEFAULTS)}")
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(self._DEFAULTS))
+
+    # ---- call = set now, optionally undo on `with` exit -------------------
+    def __call__(self, **kw):
+        snapshot = dict(self._v)
+        try:
+            for k, val in kw.items():
+                setattr(self, k, val)
+        except Exception:
+            self._v.update(snapshot)           # all-or-nothing
+            raise
+        return _Restore(self, snapshot)
+
+    def reset(self):
+        """Restore every setting to its default."""
+        self._v.update(self._DEFAULTS)
+
+    def as_dict(self):
+        return dict(self._v)
+
+    def __repr__(self):
+        body = "\n".join(f"  {k:<24s} = {v!r}" for k, v in self._v.items())
+        return f"mpl_figure_saver settings:\n{body}"
+
+
+settings = _Settings()
 
 
 # ============================================================================
-#  CONFIG (standalone; also reachable through install())
+#  CONFIG  (kept for backwards compatibility; these forward to `settings`)
 # ============================================================================
 
 def set_save_dir(path: Union[str, Path]):
-    """Set the directory for widget disk saves. Resolved to an absolute path
-    immediately, so a later os.chdir() cannot move it. Created if missing."""
-    global _widget_save_dir
-    _widget_save_dir = Path(path).expanduser().resolve()
-    _widget_save_dir.mkdir(parents=True, exist_ok=True)
-    return _widget_save_dir
+    """Same as ``settings.save_dir = path``; returns the resolved path."""
+    settings.save_dir = path
+    return settings.save_dir
 
 
 def configure(*, save_data: Optional[bool] = None,
               save_pickle: Optional[bool] = None,
               widget_mode: Optional[str] = None,
               widget_browser_download: Optional[bool] = None):
-    """Set which extras are saved and how the widget save behaves."""
-    global _widget_mode, _widget_browser_download
-    if save_data is not None:
-        _prefs['save_data'] = save_data
-    if save_pickle is not None:
-        _prefs['save_pickle'] = save_pickle
-    if widget_mode is not None:
-        if widget_mode not in ('timestamp', 'dialog'):
-            raise ValueError("widget_mode must be 'timestamp' or 'dialog'")
-        _widget_mode = widget_mode
-    if widget_browser_download is not None:
-        _widget_browser_download = widget_browser_download
+    """Set several settings at once (``None`` arguments are left unchanged).
+
+    To put ``widget_browser_download`` back to automatic, assign ``None``
+    directly: ``settings.widget_browser_download = None``.
+    """
+    given = {'save_data': save_data, 'save_pickle': save_pickle,
+             'widget_mode': widget_mode,
+             'widget_browser_download': widget_browser_download}
+    settings(**{k: v for k, v in given.items() if v is not None})
 
 
 # ============================================================================
@@ -476,7 +608,7 @@ def _figure_name_hint(fig) -> str:
 
 def _timestamp_folder(fig) -> Path:
     """B: plot_<YYYYMMDD_HHMMSS_ffffff>[_suptitle], collision-checked."""
-    base = _widget_save_dir
+    base = settings.save_dir
     stamp = datetime.now().isoformat(timespec='seconds')
     hint = _figure_name_hint(fig)
     stem = f"plot_{stamp}" + (f"_{hint}" if hint else '')
@@ -520,8 +652,8 @@ def _make_patched_widget_toolbar_save():
         from matplotlib import rcParams
         fig = self.canvas.figure
 
-        mode = _widget_mode
-        browser = _widget_browser_download
+        mode = settings.widget_mode
+        browser = settings.widget_browser_download
         if browser is None:
             browser = (mode == 'timestamp')   # dialog mode suppresses the dup download
 
@@ -551,7 +683,7 @@ def _make_patched_widget_toolbar_save():
             except Exception as e:
                 _loud(f"original widget download failed: {e}")
 
-        if _widget_save_dir is None:
+        if settings.save_dir is None:
             _loud("widget_mode='timestamp' but no save directory is set. "
                   "Nothing written to disk. Call mfs.install(save_dir=...) or "
                   "mfs.set_save_dir(...) with an absolute path.")
@@ -560,8 +692,8 @@ def _make_patched_widget_toolbar_save():
         folder = _timestamp_folder(fig)
         fmt = rcParams.get('savefig.format', 'png')
         saved = _write_extras(fig, folder, folder.name, fmt,
-                              _prefs.get('save_data', True),
-                              _prefs.get('save_pickle', True))
+                              settings.save_data,
+                              settings.save_pickle)
         _report_saved(folder, saved)
 
     return patched_save_figure
@@ -588,8 +720,8 @@ def _dialog_choose_save(fig, default_fmt):
     'timestamp' widget mode instead. tkinter ships with CPython; if it can't
     open (no display), this warns and returns None.
     """
-    want_data = _prefs.get('save_data', True)
-    want_pickle = _prefs.get('save_pickle', True)
+    want_data = settings.save_data
+    want_pickle = settings.save_pickle
 
     try:
         import tkinter as tk
@@ -608,18 +740,17 @@ def _dialog_choose_save(fig, default_fmt):
         root.wait_window(opt)
         if not proceed['ok']:
             root.destroy(); return None
-        initial = (_widget_save_dir or Path.cwd())
-        all_fmts = ['pdf', 'svg', 'png', 'jpg', 'jpeg', 'tif', 'tiff']
+        initial = (settings.save_dir or Path.cwd())
         fname = filedialog.asksaveasfilename(
             initialdir=str(initial),
             initialfile=(_figure_name_hint(fig) or 'figure') + f".{default_fmt}",
             defaultextension=f".{default_fmt}",
-            filetypes=[(f"{default_fmt.upper()}", f"*.{default_fmt}")] + list((f"{a.upper()}", f"*.{a}") for a in list(set(sorted(all_fmts))-set([default_fmt]))) + [("All files", "*.*")])
+            filetypes=[("Image", f"*.{default_fmt}"), ("All files", "*.*")])
         root.destroy()
         if not fname:
             return None
-        _prefs['save_data'] = v_data.get()
-        _prefs['save_pickle'] = v_pkl.get()
+        settings.save_data = bool(v_data.get())
+        settings.save_pickle = bool(v_pkl.get())
         p = Path(fname)
         if not p.suffix:
             p = p.with_suffix(f".{default_fmt}")
@@ -645,9 +776,9 @@ def _patched_savefig(self, fname, *args, **kwargs):
         p = Path(str(fname))
         if p.suffix in ('.mplpkl', SCENE_EXT):
             return result
-        if _prefs.get('save_pickle', True):
+        if settings.save_pickle:
             savefig_bundle(self, p.with_suffix('.mplpkl'))
-        if _prefs.get('save_data', True):
+        if settings.save_data:
             try:
                 save_scene_file(self, p.with_suffix(SCENE_EXT))
             except Exception as e:
@@ -732,10 +863,10 @@ def install(*, patch_savefig: bool = True, patch_toolbar: bool = True,
     env_dir = os.environ.get('MPL_FIG_SAVER_DIR')
     if save_dir is not None:
         set_save_dir(save_dir)
-    elif env_dir and _widget_save_dir is None:
+    elif env_dir and settings.save_dir is None:
         set_save_dir(env_dir)
 
-    if _widget_mode == 'timestamp' and _widget_save_dir is None:
+    if settings.widget_mode == 'timestamp' and settings.save_dir is None:
         _loud("widget_mode='timestamp' is set but no save_dir yet. Widget saves "
               "will write nothing until you pass save_dir=... (install) or set "
               "MPL_FIG_SAVER_DIR. Qt and fig.savefig() are unaffected.")
@@ -851,9 +982,9 @@ def _make_patched_toolbar_save(OrigToolbarClass):
             hbox = QtWidgets.QHBoxLayout(container)
             hbox.setContentsMargins(0, 4, 0, 0)
             cb_data = QtWidgets.QCheckBox("Also save plot data (.mplscene)")
-            cb_data.setChecked(_prefs['save_data'])
+            cb_data.setChecked(settings.save_data)
             cb_pickle = QtWidgets.QCheckBox("Also save editable figure (.mplpkl)")
-            cb_pickle.setChecked(_prefs['save_pickle'])
+            cb_pickle.setChecked(settings.save_pickle)
             hbox.addWidget(cb_data); hbox.addSpacing(20)
             hbox.addWidget(cb_pickle); hbox.addStretch()
             layout.addWidget(container, layout.rowCount(), 0, 1, layout.columnCount())
@@ -865,9 +996,9 @@ def _make_patched_toolbar_save(OrigToolbarClass):
             return None
         fname = fnames[0]
 
-        want_data = cb_data.isChecked() if cb_data else _prefs['save_data']
-        want_pickle = cb_pickle.isChecked() if cb_pickle else _prefs['save_pickle']
-        _prefs['save_data'], _prefs['save_pickle'] = want_data, want_pickle
+        want_data = cb_data.isChecked() if cb_data else settings.save_data
+        want_pickle = cb_pickle.isChecked() if cb_pickle else settings.save_pickle
+        settings.save_data, settings.save_pickle = bool(want_data), bool(want_pickle)
 
         if startpath != "":
             _mpl.rcParams['savefig.directory'] = os.path.dirname(fname)

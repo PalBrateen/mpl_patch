@@ -105,20 +105,25 @@ def norm(t,arr):
 def px(f):
     b=io.BytesIO(); f.savefig(b,format='png',dpi=50); b.seek(0); return mi.imread(b)[...,:3]
 
-print(f"{'recipe':16s} {'fix':5s} {'pixdiff':>8s}  issue")
-bad=[]
-for name,f in build().items():
-    try:
-        t1,a1=S.dump_figure(f); f2=S.replay_figure(t1,a1); t2,a2=S.dump_figure(f2)
-        same=norm(t1,a1)==norm(t2,a2)
-        p1,p2=px(f),px(f2)
-        d=float(np.abs(p1-p2).mean()) if p1.shape==p2.shape else float('nan')
-        rep=t1.get('report',[])+t1.get('replay_report',[])
-        key=''
-        for r in rep:
-            if 'unknown' in r or 'failed' in r: key=r[:46]; break
-        if d>0.01 or np.isnan(d): bad.append((name,d,key))
-        print(f"{name:16s} {'ok' if same else 'DIFF':5s} {d:8.4f}  {key}")
-    except Exception as e:
-        bad.append((name,999,str(e)[:40])); print(f"{name:16s} {'ERR':5s} {'-':>8s}  {type(e).__name__}: {str(e)[:40]}")
-print("\nPIXEL FAILURES (>0.01):",[(b[0],round(b[1],3)) for b in bad])
+def main():
+    print(f"{'recipe':16s} {'fix':5s} {'pixdiff':>8s}  issue")
+    bad=[]
+    for name,f in build().items():
+        try:
+            t1,a1=S.dump_figure(f); f2=S.replay_figure(t1,a1); t2,a2=S.dump_figure(f2)
+            same=norm(t1,a1)==norm(t2,a2)
+            p1,p2=px(f),px(f2)
+            d=float(np.abs(p1-p2).mean()) if p1.shape==p2.shape else float('nan')
+            rep=t1.get('report',[])+t1.get('replay_report',[])
+            key=''
+            for r in rep:
+                if 'unknown' in r or 'failed' in r: key=r[:46]; break
+            if d>0.01 or np.isnan(d): bad.append((name,d,key))
+            print(f"{name:16s} {'ok' if same else 'DIFF':5s} {d:8.4f}  {key}")
+        except Exception as e:
+            bad.append((name,999,str(e)[:40])); print(f"{name:16s} {'ERR':5s} {'-':>8s}  {type(e).__name__}: {str(e)[:40]}")
+    print("\nPIXEL FAILURES (>0.01):",[(b[0],round(b[1],3)) for b in bad])
+
+
+if __name__ == "__main__":
+    main()

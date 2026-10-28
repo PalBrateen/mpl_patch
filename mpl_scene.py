@@ -62,6 +62,40 @@ _KEEP = {'alpha', 'zorder', 'visible', 'label', 'linewidth', 'clip_on',
          'xy', 'x', 'y', 'width', 'height', 'angle', 'center', 'radius',
          'theta1', 'theta2', 'bounds'}
 
+def _hex(c):
+    """Canonical colour string, so dump(replay(dump(f))) is a true fixed point."""
+    try: return mcolors.to_hex(c, keep_alpha=True)
+    except Exception: return c
+
+
+def _text_style(t):
+    """Font-related style of a Text artist (size/weight/style/family/color...).
+
+    Stored explicitly so a replay does not silently fall back to whatever
+    rcParams happen to be active when the figure is reopened.
+    """
+    try:
+        fam = t.get_fontfamily()
+        return {"size": float(t.get_fontsize()),
+                "weight": t.get_fontweight(),
+                "style": t.get_fontstyle(),
+                "family": list(fam) if isinstance(fam, (list, tuple)) else fam,
+                "color": mcolors.to_hex(t.get_color(), keep_alpha=True),
+                "rotation": float(t.get_rotation())}
+    except Exception:
+        return {}
+
+
+def _apply_text_style(t, st):
+    if not st: return
+    for k, meth in (("size", "set_fontsize"), ("weight", "set_fontweight"),
+                    ("style", "set_fontstyle"), ("family", "set_fontfamily"),
+                    ("color", "set_color"), ("rotation", "set_rotation")):
+        if st.get(k) is not None:
+            try: getattr(t, meth)(st[k])
+            except Exception: pass
+
+
 def _tf_tag(tr, ax, fig):
     if ax is not None:
         if tr is ax.transData: return "data"
@@ -442,7 +476,8 @@ def _dump_axis(ax, which):
     d = {
         "scale": get[0](), "lim": [float(v) for v in get[1]()],
         "label": axis.get_label().get_text(),
-        "label_color": axis.label.get_color(),
+        "label_color": _hex(axis.label.get_color()),
+        "label_style": _text_style(axis.label),
         "autoscale": bool(ax.get_autoscalex_on() if which == "x" else ax.get_autoscaley_on()),
         "major_loc": _enc_locator(axis.get_major_locator()),
         "major_fmt": _enc_formatter(axis.get_major_formatter()),
@@ -461,7 +496,7 @@ def _dump_axis(ax, which):
     except Exception: d["tick_params"] = {}
     try:
         tl = axis.get_majorticklabels()
-        d["tick_color"] = tl[0].get_color() if tl else None
+        d["tick_color"] = _hex(tl[0].get_color()) if tl else None
     except Exception: d["tick_color"] = None
     return d
 
@@ -479,6 +514,7 @@ def _apply_axis(ax, which, d, report):
     axis.set_minor_formatter(_dec_formatter(d["minor_fmt"]))
     (ax.set_xlabel if which == "x" else ax.set_ylabel)(
         d.get("label", ""), color=d.get("label_color") or "black")
+    _apply_text_style(axis.label, d.get("label_style"))
     if d.get("tick_params"):
         try: ax.tick_params(axis=which, **d["tick_params"])
         except Exception: pass
@@ -504,7 +540,10 @@ def dump_figure(fig):
             "figure": {"size": [float(v) for v in fig.get_size_inches()],
                        "dpi": float(fig.dpi),
                        "facecolor": mcolors.to_hex(fig.get_facecolor(), keep_alpha=True),
-                       "suptitle": fig._suptitle.get_text() if fig._suptitle else ""},
+                       "suptitle": fig._suptitle.get_text() if fig._suptitle else "",
+                       "suptitle_style": (_text_style(fig._suptitle)
+                                          if fig._suptitle else {}),
+                       "mfs_scale": float(getattr(fig, "_mfs_scale", 1.0))},
             "axes": []}
     cbar_of = {}
     for i, ax in enumerate(axes):
@@ -524,6 +563,12 @@ def dump_figure(fig):
                 "pos": [float(v) for v in ax.get_position().bounds],
                 "geom": None, "projection": ax.name,
                 "title": ax.get_title(),
+                "titles": {loc: {"text": ax.get_title(loc=loc),
+                                 "style": _text_style({"center": ax.title,
+                                                       "left": ax._left_title,
+                                                       "right": ax._right_title}[loc])}
+                           for loc in ("center", "left", "right")
+                           if ax.get_title(loc=loc)},
                 "facecolor": mcolors.to_hex(ax.get_facecolor(), keep_alpha=True),
                 "aspect": (ax.get_aspect() if isinstance(ax.get_aspect(), str)
                            else float(ax.get_aspect())),
@@ -586,7 +631,10 @@ def dump_figure(fig):
                                       else "best"),
                               "ncols": int(getattr(leg, "_ncols", 1) or 1),
                               "frameon": bool(leg.get_frame_on()),
-                              "title": leg.get_title().get_text()}
+                              "title": leg.get_title().get_text(),
+                              "text_style": (_text_style(leg.get_texts()[0])
+                                             if leg.get_texts() else {}),
+                              "title_style": _text_style(leg.get_title())}
         owned = set()
         for cont in getattr(ax, "containers", []):
             for ch in cont.get_children():
@@ -656,7 +704,7 @@ def _replay_container(ax, cd, arrays, report):
         report.append(f"unknown container {cls}")
 
 
-def replay_figure(tree, arrays):
+def replay_figure(tree, arrays, figsize=None, scale="auto"):
     report = []
     f = tree["figure"]
     fig = plt.figure(figsize=f["size"], dpi=f["dpi"], facecolor=f["facecolor"])
@@ -690,7 +738,11 @@ def replay_figure(tree, arrays):
         if ax is None: continue
         try: ax.set_position(n["pos"])      # exact saved layout
         except Exception: pass
-        ax.set_facecolor(n["facecolor"]); ax.set_title(n["title"])
+        ax.set_facecolor(n["facecolor"])
+        for loc, tt in (n.get("titles") or {"center": {"text": n["title"], "style": {}}}).items():
+            ax.set_title(tt["text"], loc=loc)
+            _apply_text_style({"center": ax.title, "left": ax._left_title,
+                               "right": ax._right_title}[loc], tt.get("style"))
         try: ax.set_aspect(n["aspect"])
         except Exception: pass
         for cd in n.get("containers", []):
@@ -724,14 +776,19 @@ def replay_figure(tree, arrays):
         if n.get("legend"):
             h, l = ax.get_legend_handles_labels()
             if l:
+                lg = n["legend"]
+                kw = dict(title=lg["title"] or None, frameon=lg["frameon"])
+                ts = lg.get("text_style") or {}
+                if ts.get("size") is not None: kw["fontsize"] = ts["size"]
+                if (lg.get("title_style") or {}).get("size") is not None:
+                    kw["title_fontsize"] = lg["title_style"]["size"]
                 try:
-                    ax.legend(title=n["legend"]["title"] or None,
-                              frameon=n["legend"]["frameon"],
-                              loc=n["legend"].get("loc", "best"),
-                              ncols=n["legend"].get("ncols", 1))
+                    leg_obj = ax.legend(loc=lg.get("loc", "best"),
+                                        ncols=lg.get("ncols", 1), **kw)
                 except Exception:
-                    ax.legend(title=n["legend"]["title"] or None,
-                              frameon=n["legend"]["frameon"])
+                    leg_obj = ax.legend(**kw)
+                for t_ in leg_obj.get_texts(): _apply_text_style(t_, ts)
+                _apply_text_style(leg_obj.get_title(), lg.get("title_style"))
     # Colorbars: the cbar axes was created at its saved position like any other
     # axes, so attach with cax= — using ax= would shrink the parent a 2nd time.
     for ci, info in (tree.get("colorbars") or {}).items():
@@ -754,7 +811,12 @@ def replay_figure(tree, arrays):
         if ax is None: continue
         ax.set_autoscalex_on(bool(n["x"].get("autoscale")))
         ax.set_autoscaley_on(bool(n["y"].get("autoscale")))
-    if f.get("suptitle"): fig.suptitle(f["suptitle"])
+    if f.get("suptitle"):
+        st = fig.suptitle(f["suptitle"])
+        _apply_text_style(st, f.get("suptitle_style"))
+    fig._mfs_scale = float(f.get("mfs_scale", 1.0))
+    if figsize is not None:
+        resize_figure(fig, figsize, scale)    # relation to the SAVED size
     tree.setdefault("replay_report", []).extend(report)
     return fig
 
@@ -1081,3 +1143,153 @@ def read_data(path):
     """FigureData from a saved .mplscene file."""
     tree, arrays = load_scene(path)
     return extract_data(tree, arrays)
+
+
+# ===========================================================================
+#  SIZE-AWARE SCALING
+#  matplotlib keeps figsize (inches) and every size (points) independent, which
+#  is right for publication work (8 pt text must stay 8 pt). But when a figure
+#  is *resized*, everything should scale together or it looks wrong. These are
+#  explicit, opt-in tools: nothing here runs unless you call it.
+# ===========================================================================
+
+def _scale_axes(ax, k):
+    for ln in ax.lines:
+        ln.set_linewidth(ln.get_linewidth() * k)
+        ln.set_markersize(ln.get_markersize() * k)
+        ln.set_markeredgewidth(ln.get_markeredgewidth() * k)
+    for c in ax.collections:
+        try:
+            lw = np.asarray(c.get_linewidth(), float)
+            if lw.size: c.set_linewidth(lw * k)
+            sz = np.asarray(c.get_sizes(), float)
+            if sz.size: c.set_sizes(sz * k * k)      # marker AREA scales as k^2
+        except Exception:
+            pass
+    for p in ax.patches:
+        p.set_linewidth(p.get_linewidth() * k)
+        if isinstance(p, FancyArrowPatch):       # e.g. streamplot arrowheads
+            p.set_mutation_scale(p.get_mutation_scale() * k)
+    for t in ax.texts:
+        ap = getattr(t, "arrow_patch", None)
+        if ap is not None:
+            ap.set_linewidth(ap.get_linewidth() * k)
+            ap.set_mutation_scale(ap.get_mutation_scale() * k)
+    for sp in ax.spines.values():
+        sp.set_linewidth(sp.get_linewidth() * k)
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.labelpad = axis.labelpad * k
+        for which, ticks in (("major", axis.majorTicks), ("minor", axis.minorTicks)):
+            if not ticks: continue
+            t0 = ticks[0]
+            axis.set_tick_params(
+                which=which,
+                length=t0.tick1line.get_markersize() * k,
+                width=t0.tick1line.get_markeredgewidth() * k,
+                pad=t0.get_pad() * k,
+                labelsize=t0.label1.get_fontsize() * k,
+                grid_linewidth=t0.gridline.get_linewidth() * k)
+    leg = ax.get_legend()
+    if leg is not None:
+        try: leg.get_frame().set_linewidth(leg.get_frame().get_linewidth() * k)
+        except Exception: pass
+        handles = (getattr(leg, "legend_handles", None)
+                   or getattr(leg, "legendHandles", []) or [])
+        for h in handles:
+            try:
+                if hasattr(h, "set_linewidth"):
+                    lw = np.asarray(h.get_linewidth(), float)
+                    h.set_linewidth(lw * k if lw.ndim else float(lw) * k)
+                if hasattr(h, "set_markersize"):
+                    h.set_markersize(h.get_markersize() * k)
+                if hasattr(h, "get_sizes") and np.asarray(h.get_sizes()).size:
+                    h.set_sizes(np.asarray(h.get_sizes(), float) * k * k)
+            except Exception:
+                pass
+
+
+def scale_figure(fig, factor=None, *, reference=None):
+    """Scale every size in a figure together: fonts, line widths, markers, ticks.
+
+    Does NOT change the figure's size in inches; see :func:`resize_figure` for
+    that. matplotlib keeps figsize and point sizes independent on purpose (so
+    that 8 pt text stays 8 pt), so nothing is scaled unless you call this.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    factor : float | None
+        Multiply all sizes by this. ``None`` means "fit the figure's current
+        size", i.e. ``min(width/ref_w, height/ref_h)`` relative to *reference*.
+        The ``None`` form is idempotent: calling it twice does nothing the
+        second time (the applied scale is remembered on the figure).
+    reference : (float, float) | None
+        The (width, height) in inches at which the current sizes look right.
+        Defaults to matplotlib's design size, ``rcParamsDefault['figure.figsize']``
+        (6.4 x 4.8).
+
+    Returns
+    -------
+    Figure
+        The same figure, for chaining.
+
+    Examples
+    --------
+    >>> fig, ax = plt.subplots(figsize=(12, 8))   # fonts look tiny at 12x8
+    >>> mfs.scale_figure(fig)                      # fit them to the size
+    >>> mfs.scale_figure(fig, 1.5)                 # or by an explicit factor
+    """
+    cur = float(getattr(fig, "_mfs_scale", 1.0))
+    if factor is None:
+        ref = reference or matplotlib.rcParamsDefault["figure.figsize"]
+        w, h = fig.get_size_inches()
+        k = min(w / ref[0], h / ref[1]) / cur
+    else:
+        k = float(factor)
+    if not np.isfinite(k) or k <= 0:
+        raise ValueError(f"scale factor must be a positive number, got {k!r}")
+    if abs(k - 1.0) < 1e-12:
+        return fig
+
+    skip = set()                       # tick labels are scaled via tick params
+    for ax in fig.axes:
+        for axis in (ax.xaxis, ax.yaxis):
+            for t in list(axis.majorTicks) + list(axis.minorTicks):
+                skip.update((id(t.label1), id(t.label2)))
+            skip.add(id(axis.offsetText))
+    for t in fig.findobj(Text):
+        if id(t) not in skip:
+            t.set_fontsize(t.get_fontsize() * k)
+    for ax in fig.axes:
+        try: _scale_axes(ax, k)
+        except Exception: pass
+    fig._mfs_scale = cur * k
+    return fig
+
+
+def resize_figure(fig, figsize, scale="auto"):
+    """Change a figure's size in inches, scaling its contents to match.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    figsize : (float, float)
+        New (width, height) in inches.
+    scale : "auto" | float | False
+        ``"auto"``: scale by ``min(new_w/old_w, new_h/old_h)`` so the figure
+        keeps its proportions and nothing overflows. A number forces that
+        factor. ``False`` resizes without touching fonts (plain
+        ``set_size_inches``).
+    """
+    w0, h0 = fig.get_size_inches()
+    w1, h1 = float(figsize[0]), float(figsize[1])
+    if scale == "auto":
+        k = min(w1 / w0, h1 / h0)
+    elif scale is False or scale is None:
+        k = 1.0
+    else:
+        k = float(scale)
+    fig.set_size_inches(w1, h1)
+    if k != 1.0:
+        scale_figure(fig, k)
+    return fig
